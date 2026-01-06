@@ -8,7 +8,7 @@ Bus9 is a minimalist, ultra-lightweight "all-in-one" message broker. It combines
 Run Bus9 with a single command:
 
 ```bash
-docker run -p 8080:8080 denis/bus9
+docker run -p 8080:8080 denyzhirkov/bus9
 ```
 
 Open in your browser: `http://localhost:8080`
@@ -18,7 +18,7 @@ You will need Rust and Node.js.
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/your-username/bus9.git
+git clone https://github.com/denyzhirkov/bus9.git
 cd bus9
 
 # 2. Run (automatically builds frontend and starts server)

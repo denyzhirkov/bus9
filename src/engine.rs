@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::{RwLock};
+use parking_lot::RwLock;
 use tokio::sync::broadcast;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -37,7 +37,7 @@ impl Engine {
     }
 
     pub fn publish(&self, topic: &str, msg: Message) -> usize {
-        let mut topics = self.topics.write().unwrap();
+        let mut topics = self.topics.write();
         if let Some(sender) = topics.get(topic) {
              sender.send(msg).unwrap_or(0)
         } else {
@@ -49,7 +49,7 @@ impl Engine {
     }
     
     pub fn subscribe(&self, topic: &str) -> broadcast::Receiver<Message> {
-        let mut topics = self.topics.write().unwrap();
+        let mut topics = self.topics.write();
         let tx = topics.entry(topic.to_string()).or_insert_with(|| {
             let (tx, _rx) = broadcast::channel(1024);
             tx
@@ -58,18 +58,18 @@ impl Engine {
     }
 
     pub fn push_queue(&self, queue: &str, msg: Message) {
-        let mut queues = self.queues.write().unwrap();
+        let mut queues = self.queues.write();
         queues.entry(queue.to_string()).or_default().push_back(msg);
     }
     
     pub fn pop_queue(&self, queue: &str) -> Option<Message> {
-        let mut queues = self.queues.write().unwrap();
+        let mut queues = self.queues.write();
         queues.get_mut(queue).and_then(|q| q.pop_front())
     }
 
     pub fn get_stats(&self) -> serde_json::Value {
-        let topics = self.topics.read().unwrap();
-        let queues = self.queues.read().unwrap();
+        let topics = self.topics.read();
+        let queues = self.queues.read();
         
         let topic_stats: HashMap<_, _> = topics.iter().map(|(k, v)| (k, v.receiver_count())).collect();
         let queue_stats: HashMap<_, _> = queues.iter().map(|(k, v)| (k, v.len())).collect();

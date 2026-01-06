@@ -24,18 +24,18 @@ function App() {
   const wsRef = useRef<WebSocket | null>(null)
 
   useEffect(() => {
-    const fetchStats = async () => {
+    const proto = window.location.protocol === 'https:' ? 'wss' : 'ws'
+    const host = window.location.host
+    const ws = new WebSocket(`${proto}://${host}/api/ws/stats`)
+
+    ws.onmessage = (event) => {
       try {
-        const res = await fetch('/api/stats')
-        const data = await res.json()
+        const data = JSON.parse(event.data)
         setStats(data)
-      } catch (e) {
-        console.error(e)
-      }
+      } catch (e) { console.error(e) }
     }
-    const interval = setInterval(fetchStats, 1000)
-    fetchStats()
-    return () => clearInterval(interval)
+
+    return () => ws.close()
   }, [])
 
   useEffect(() => {
@@ -70,8 +70,8 @@ function App() {
   return (
     <div style={{ padding: '2rem', maxWidth: '1200px', margin: '0 auto' }}>
       <header style={{ marginBottom: '3rem', display: 'flex', alignItems: 'center', gap: '1rem' }}>
-        <div style={{ width: 40, height: 40, background: 'var(--accent-color)', borderRadius: 8, display: 'grid', placeItems: 'center', boxShadow: '0 0 20px var(--accent-glow)' }}>
-          <span style={{ fontWeight: 'bold', color: 'black' }}>B9</span>
+        <div style={{ width: 40, height: 40, borderRadius: 8, overflow: 'hidden', boxShadow: '0 0 20px var(--accent-glow)' }}>
+          <img src="/logo.png" style={{ width: '100%', height: '100%', objectFit: 'cover' }} alt="Bus9 Logo" />
         </div>
         <div>
           <h1 style={{ margin: 0, fontSize: '2rem' }}>Bus9</h1>

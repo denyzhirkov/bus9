@@ -34,14 +34,55 @@ async fn main() {
         .route("/api/sub", get(subscribe_handler))
         .route("/api/queue/:name", post(push_queue_handler).get(pop_queue_handler))
         .route("/api/stats", get(stats_handler))
+        .route("/api/ws/stats", get(stats_ws_handler))
         .fallback(static_handler)
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
     println!("Listening on http://{}", addr);
     
-    let listener = TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let listener = match TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Error: Could not bind to address {}: {}", addr, e);
+            std::process::exit(1);
+        }
+    };
+
+    println!("Bus9 server started successfully");
+
+    if let Err(e) = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await 
+    {
+        eprintln!("Server error: {}", e);
+    }
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+
+    println!("Signal received, starting graceful shutdown...");
 }
 
 async fn health_handler() -> &'static str {
@@ -134,5 +175,25 @@ async fn index_handler() -> impl IntoResponse {
             ([(header::CONTENT_TYPE, mime.as_ref())], content.data).into_response()
         }
         None => (StatusCode::NOT_FOUND, "index.html not found").into_response(),
+    }
+}
+
+async fn stats_ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    ws.on_upgrade(|socket| handle_stats_socket(socket, state))
+}
+
+async fn handle_stats_socket(mut socket: WebSocket, state: Arc<AppState>) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+    loop {
+        interval.tick().await;
+        let stats = state.engine.get_stats();
+        let text = serde_json::to_string(&stats).unwrap();
+        
+        if socket.send(axum::extract::ws::Message::Text(text.into())).await.is_err() {
+            break;
+        }
     }
 }
