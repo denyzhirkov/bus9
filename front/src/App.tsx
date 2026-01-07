@@ -3,21 +3,47 @@ import { motion, AnimatePresence } from 'framer-motion'
 import { Activity, Radio, Server, Boxes, Send, BarChart3 } from 'lucide-react'
 import './index.css'
 
+interface EntryMeta {
+  ttl_seconds: number | null
+  created_at: number
+  last_activity: number
+}
+
+interface TopicStatus {
+  subscribers: number
+  meta: EntryMeta
+  expires_at: number | null
+}
+
+interface QueueStatus {
+  depth: number
+  meta: EntryMeta
+  expires_at: number | null
+}
+
+interface ExpiredEntry {
+  name: string
+  kind: string
+  expired_at: number
+}
+
 interface Stats {
-  topics: Record<string, number>
-  queues: Record<string, number>
+  topics: Record<string, TopicStatus>
+  queues: Record<string, QueueStatus>
+  expired: ExpiredEntry[]
 }
 
 interface MetricsResponse {
   requests: Record<string, number>
   topics: {
     active: number
-    subscribers: Record<string, number>
+    entries: Record<string, TopicStatus>
   }
   queues: {
     active: number
-    depth: Record<string, number>
+    entries: Record<string, QueueStatus>
   }
+  expired: ExpiredEntry[]
 }
 
 interface LogMessage {
@@ -27,11 +53,12 @@ interface LogMessage {
 }
 
 function App() {
-  const [stats, setStats] = useState<Stats>({ topics: {}, queues: {} })
+  const [stats, setStats] = useState<Stats>({ topics: {}, queues: {}, expired: [] })
   const [metrics, setMetrics] = useState<MetricsResponse>({
     requests: {},
-    topics: { active: 0, subscribers: {} },
-    queues: { active: 0, depth: {} },
+    topics: { active: 0, entries: {} },
+    queues: { active: 0, entries: {} },
+    expired: [],
   })
   const [requestHistory, setRequestHistory] = useState<number[]>([])
   const [msgInput, setMsgInput] = useState('')
@@ -39,6 +66,7 @@ function App() {
   const [mode, setMode] = useState<'pub' | 'queue'>('pub')
   const [logs, setLogs] = useState<LogMessage[]>([])
   const [subTopic, setSubTopic] = useState('test')
+  const [ttlSeconds, setTtlSeconds] = useState('')
   const wsRef = useRef<WebSocket | null>(null)
 
   useEffect(() => {
@@ -106,13 +134,28 @@ function App() {
       ? `/api/pub?topic=${target}`
       : `/api/queue/${target}`
 
-    await fetch(url, { method: 'POST', body: msgInput })
+    const ttlInput = ttlSeconds.trim()
+    const parsedTtl = ttlInput ? Number(ttlInput) : null
+    const ttlValue = parsedTtl && parsedTtl > 0 ? parsedTtl : null
+    const requestBody = ttlValue
+      ? JSON.stringify({ payload: msgInput, ttl_seconds: ttlValue })
+      : JSON.stringify({ payload: msgInput })
+    await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: requestBody,
+    })
     setMsgInput('')
   }
 
   const requestEntries = Object.entries(metrics.requests).sort((a, b) => b[1] - a[1])
-  const subscriberEntries = Object.entries(metrics.topics.subscribers).sort((a, b) => b[1] - a[1])
-  const queueEntries = Object.entries(metrics.queues.depth).sort((a, b) => b[1] - a[1])
+  const subscriberEntries = Object.entries(metrics.topics.entries)
+    .map(([name, entry]) => [name, entry.subscribers] as const)
+    .sort((a, b) => b[1] - a[1])
+  const queueEntries = Object.entries(metrics.queues.entries)
+    .map(([name, entry]) => [name, entry.depth] as const)
+    .sort((a, b) => b[1] - a[1])
+  const expiredEntries = stats.expired.slice().reverse().slice(0, 6)
 
   const totalRequests = requestEntries.reduce((sum, [, value]) => sum + value, 0)
   const totalSubscribers = subscriberEntries.reduce((sum, [, value]) => sum + value, 0)
@@ -122,6 +165,21 @@ function App() {
   const maxSubscribers = Math.max(1, ...subscriberEntries.map(([, value]) => value))
   const maxQueueDepth = Math.max(1, ...queueEntries.map(([, value]) => value))
   const maxHistory = Math.max(1, ...requestHistory)
+
+  const formatRemaining = (expiresAt: number | null) => {
+    if (!expiresAt) return 'No TTL'
+    const remainingMs = Math.max(0, expiresAt - Date.now())
+    const remainingSeconds = Math.ceil(remainingMs / 1000)
+    if (remainingSeconds < 60) return `${remainingSeconds}s`
+    const minutes = Math.floor(remainingSeconds / 60)
+    const seconds = remainingSeconds % 60
+    return `${minutes}m ${seconds}s`
+  }
+
+  const formatTtlLabel = (meta: EntryMeta, expiresAt: number | null) => {
+    if (!meta.ttl_seconds) return 'No TTL'
+    return `TTL ${meta.ttl_seconds}s • expires in ${formatRemaining(expiresAt)}`
+  }
 
   return (
     <div style={{ padding: '2rem', maxWidth: '1200px', margin: '0 auto' }}>
@@ -248,11 +306,14 @@ function App() {
             <h2 style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginTop: 0 }}><Activity size={20} /> Active Topics</h2>
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: '1rem', marginTop: '1rem' }}>
               {Object.entries(stats.topics).length === 0 && <span style={{ opacity: 0.5 }}>No active topics</span>}
-              {Object.entries(stats.topics).map(([name, count]) => (
-                <motion.div layoutId={`topic-${name}`} key={name} style={{ background: 'rgba(255,255,255,0.05)', padding: '0.5rem 1rem', borderRadius: 20, border: '1px solid var(--border-color)', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                  <Radio size={14} color="var(--accent-color)" />
-                  <span>{name}</span>
-                  <span style={{ background: 'var(--accent-color)', color: 'black', borderRadius: 10, padding: '0 6px', fontSize: '0.8em', fontWeight: 'bold' }}>{count}</span>
+              {Object.entries(stats.topics).map(([name, info]) => (
+                <motion.div layoutId={`topic-${name}`} key={name} style={{ background: 'rgba(255,255,255,0.05)', padding: '0.5rem 1rem', borderRadius: 20, border: '1px solid var(--border-color)', display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                    <Radio size={14} color="var(--accent-color)" />
+                    <span>{name}</span>
+                    <span style={{ background: 'var(--accent-color)', color: 'black', borderRadius: 10, padding: '0 6px', fontSize: '0.8em', fontWeight: 'bold' }}>{info.subscribers}</span>
+                  </div>
+                  <span style={{ fontSize: '0.75em', color: 'var(--text-secondary)' }}>{formatTtlLabel(info.meta, info.expires_at)}</span>
                 </motion.div>
               ))}
             </div>
@@ -264,15 +325,35 @@ function App() {
             <h2 style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginTop: 0 }}><Boxes size={20} /> Active Queues</h2>
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: '1rem', marginTop: '1rem' }}>
               {Object.entries(stats.queues).length === 0 && <span style={{ opacity: 0.5 }}>No queues</span>}
-              {Object.entries(stats.queues).map(([name, count]) => (
-                <motion.div layoutId={`queue-${name}`} key={name} style={{ background: 'rgba(255,255,255,0.05)', padding: '0.5rem 1rem', borderRadius: 6, border: '1px solid var(--border-color)', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                  <Server size={14} color={count > 0 ? 'var(--success-color)' : 'gray'} />
-                  <span>{name}</span>
-                  <span style={{ background: count > 0 ? 'var(--success-color)' : 'gray', color: 'black', borderRadius: 10, padding: '0 6px', fontSize: '0.8em', fontWeight: 'bold' }}>{count}</span>
+              {Object.entries(stats.queues).map(([name, info]) => (
+                <motion.div layoutId={`queue-${name}`} key={name} style={{ background: 'rgba(255,255,255,0.05)', padding: '0.5rem 1rem', borderRadius: 6, border: '1px solid var(--border-color)', display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                    <Server size={14} color={info.depth > 0 ? 'var(--success-color)' : 'gray'} />
+                    <span>{name}</span>
+                    <span style={{ background: info.depth > 0 ? 'var(--success-color)' : 'gray', color: 'black', borderRadius: 10, padding: '0 6px', fontSize: '0.8em', fontWeight: 'bold' }}>{info.depth}</span>
+                  </div>
+                  <span style={{ fontSize: '0.75em', color: 'var(--text-secondary)' }}>{formatTtlLabel(info.meta, info.expires_at)}</span>
                 </motion.div>
               ))}
             </div>
           </div>
+        </div>
+
+        <div className="panel" style={{ gridColumn: 'span 2' }}>
+          <h2 style={{ marginTop: 0 }}>Recently Expired</h2>
+          {expiredEntries.length === 0 ? (
+            <span style={{ opacity: 0.6 }}>No expirations yet</span>
+          ) : (
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '0.75rem' }}>
+              {expiredEntries.map(entry => (
+                <div key={`${entry.kind}-${entry.name}-${entry.expired_at}`} style={{ border: '1px solid var(--border-color)', borderRadius: 10, padding: '0.75rem', background: 'rgba(255,255,255,0.02)' }}>
+                  <div style={{ fontWeight: 600 }}>{entry.name}</div>
+                  <div style={{ fontSize: '0.8em', color: 'var(--text-secondary)' }}>{entry.kind} expired</div>
+                  <div style={{ fontSize: '0.75em', color: 'var(--text-secondary)' }}>{new Date(entry.expired_at).toLocaleTimeString()}</div>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
 
         {/* Controls */}
@@ -291,6 +372,16 @@ function App() {
             <div>
               <label style={{ display: 'block', marginBottom: '0.5rem', fontSize: '0.9em', color: 'var(--text-secondary)' }}>Payload</label>
               <input value={msgInput} onChange={e => setMsgInput(e.target.value)} placeholder="Type a message..." onKeyDown={e => e.key === 'Enter' && handleSend()} />
+            </div>
+            <div>
+              <label style={{ display: 'block', marginBottom: '0.5rem', fontSize: '0.9em', color: 'var(--text-secondary)' }}>Inactivity TTL (seconds, optional)</label>
+              <input
+                type="number"
+                min="1"
+                value={ttlSeconds}
+                onChange={e => setTtlSeconds(e.target.value)}
+                placeholder="e.g. 120"
+              />
             </div>
             <button onClick={handleSend} style={{ background: 'var(--accent-color)', color: 'black', borderColor: 'transparent', marginTop: '0.5rem', display: 'flex', justifyContent: 'center', gap: '0.5rem' }}>
               <Send size={18} /> Send
