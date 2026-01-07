@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use parking_lot::RwLock;
 
 mod engine;
-use engine::{Engine, EngineConfig, ExpiredEntry, Message, QueueStatus, TopicStatus};
+use engine::{Engine, EngineConfig, ExpiredEntry, Message, MessagePriority, QueueStatus, TopicStatus};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -42,6 +42,24 @@ struct AppArgs {
     /// Stats update interval in milliseconds
     #[arg(long, env = "BUS9_STATS_INTERVAL_MS", default_value_t = 500)]
     stats_interval_ms: u64,
+
+    /// Number of messages to replay to new subscribers (0 = disabled)
+    #[arg(long, env = "BUS9_TOPIC_REPLAY_COUNT", default_value_t = 0)]
+    topic_replay_count: usize,
+
+    /// Inactivity timeout in seconds for auto-cleanup (0 = disabled)
+    #[arg(long, env = "BUS9_INACTIVITY_TIMEOUT_SECONDS")]
+    inactivity_timeout_seconds: Option<u64>,
+
+    /// Topic exclusion patterns (comma-separated). Topics matching these patterns will be excluded from wildcard subscriptions.
+    /// Example: --topic-exclude-patterns "sensor.secret,logs.admin.**"
+    #[arg(long, env = "BUS9_TOPIC_EXCLUDE_PATTERNS", value_delimiter = ',')]
+    topic_exclude_patterns: Vec<String>,
+
+    /// Global authentication token. If set, all API requests (pub, sub, queue) must include this token.
+    /// Token must be provided as query parameter: ?token=<token>
+    #[arg(long, env = "BUS9_AUTH_TOKEN")]
+    auth_token: Option<String>,
 }
 
 #[derive(RustEmbed)]
@@ -52,6 +70,7 @@ struct AppState {
     engine: Arc<Engine>,
     metrics: MetricsStore,
     config: AppConfig,
+    auth_token: Option<String>,
 }
 
 struct MetricsStore {
@@ -107,6 +126,9 @@ async fn main() {
     let engine_config = EngineConfig {
         broadcast_channel_capacity: args.topic_capacity,
         max_expired_events: args.max_expired,
+        topic_replay_count: args.topic_replay_count,
+        inactivity_timeout_seconds: args.inactivity_timeout_seconds,
+        topic_exclude_patterns: args.topic_exclude_patterns,
     };
 
     let engine = Arc::new(Engine::new(engine_config));
@@ -127,6 +149,7 @@ async fn main() {
         config: AppConfig {
             stats_interval_ms: args.stats_interval_ms,
         },
+        auth_token: args.auth_token,
     });
 
     let app = Router::new()
@@ -198,6 +221,20 @@ const REQ_STATS: &str = "GET /api/stats";
 const REQ_STATS_WS: &str = "GET /api/ws/stats";
 const REQ_METRICS: &str = "GET /api/metrics";
 
+/// Check if request is authorized
+fn check_auth(state: &AppState, query_token: Option<&String>) -> Result<(), StatusCode> {
+    // If no auth token is configured, allow all requests
+    let required_token = match &state.auth_token {
+        Some(token) => token,
+        None => return Ok(()),
+    };
+    
+    match query_token {
+        Some(token) if token == required_token => Ok(()),
+        _ => Err(StatusCode::UNAUTHORIZED),
+    }
+}
+
 async fn health_handler(State(state): State<Arc<AppState>>) -> &'static str {
     state.metrics.increment(REQ_HEALTH);
     "OK"
@@ -207,17 +244,21 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> &'static str {
 struct PublishParams {
     topic: String,
     ttl_seconds: Option<u64>,
+    token: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct QueueParams {
     ttl_seconds: Option<u64>,
+    priority: Option<String>,
+    token: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct PayloadRequest {
     payload: String,
     ttl_seconds: Option<u64>,
+    priority: Option<String>,
 }
 
 async fn publish_handler(
@@ -225,13 +266,18 @@ async fn publish_handler(
     Query(params): Query<PublishParams>,
     body: String,
 ) -> impl IntoResponse {
+    // Check authentication
+    if let Err(status) = check_auth(&state, params.token.as_ref()) {
+        return (status, "Unauthorized").into_response();
+    }
+    
     state.metrics.increment(REQ_PUB);
-    let (payload, body_ttl) = parse_payload(body);
+    let (payload, body_ttl, _) = parse_payload(body);
     let msg = Message::new(payload);
     let count = state
         .engine
         .publish(&params.topic, msg.clone(), body_ttl.or(params.ttl_seconds));
-    Json(serde_json::json!({ "count": count, "id": msg.id }))
+    Json(serde_json::json!({ "count": count, "id": msg.id })).into_response()
 }
 
 async fn subscribe_handler(
@@ -239,8 +285,14 @@ async fn subscribe_handler(
     Query(params): Query<PublishParams>,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
+    // Check authentication
+    if let Err(status) = check_auth(&state, params.token.as_ref()) {
+        return (status, "Unauthorized").into_response();
+    }
+    
     state.metrics.increment(REQ_SUB);
     ws.on_upgrade(move |socket| handle_socket(socket, state, params.topic, params.ttl_seconds))
+        .into_response()
 }
 
 async fn handle_socket(
@@ -249,13 +301,81 @@ async fn handle_socket(
     topic: String,
     ttl_seconds: Option<u64>,
 ) {
-    let mut rx = state.engine.subscribe(&topic, ttl_seconds);
-    while let Ok(msg) = rx.recv().await {
-        let text = serde_json::to_string(&msg).unwrap();
-        if socket.send(axum::extract::ws::Message::Text(text.into())).await.is_err() {
-            break;
+    // Check if this is a pattern subscription
+    if topic.contains('*') {
+        // Pattern-based subscription
+        let subscriptions = state.engine.subscribe_pattern(&topic, ttl_seconds);
+        
+        // Send replay history for all matching topics
+        for (_topic_name, _, history) in &subscriptions {
+            for msg in history {
+                let text = serde_json::to_string(&msg).unwrap();
+                if socket.send(axum::extract::ws::Message::Text(text.into())).await.is_err() {
+                    return;
+                }
+            }
+        }
+        
+        // Merge messages from all matching topics
+        if subscriptions.is_empty() {
+            // No matching topics yet, wait for new ones
+            // We'll need to periodically check for new topics
+            // For now, just close if no matches
+            return;
+        }
+        
+        // Create a merged stream from all subscriptions
+        use tokio::sync::mpsc;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        
+        // Spawn tasks to forward messages from each subscription
+        for (topic_name, mut receiver, _) in subscriptions {
+            let tx_clone = tx.clone();
+            tokio::spawn(async move {
+                while let Ok(msg) = receiver.recv().await {
+                    let _ = tx_clone.send((topic_name.clone(), msg));
+                }
+            });
+        }
+        drop(tx);
+        
+        // Forward merged messages to WebSocket
+        while let Some((_topic_name, msg)) = rx.recv().await {
+            // Optionally include topic name in message
+            let text = serde_json::to_string(&msg).unwrap();
+            if socket.send(axum::extract::ws::Message::Text(text.into())).await.is_err() {
+                break;
+            }
+        }
+    } else {
+        // Regular single topic subscription
+        let (mut rx, history) = state.engine.subscribe(&topic, ttl_seconds);
+        
+        // Send replay history first
+        for msg in history {
+            let text = serde_json::to_string(&msg).unwrap();
+            if socket.send(axum::extract::ws::Message::Text(text.into())).await.is_err() {
+                return;
+            }
+        }
+        
+        // Then send live messages
+        while let Ok(msg) = rx.recv().await {
+            let text = serde_json::to_string(&msg).unwrap();
+            if socket.send(axum::extract::ws::Message::Text(text.into())).await.is_err() {
+                break;
+            }
         }
     }
+}
+
+fn parse_priority(priority_str: Option<&String>) -> Option<MessagePriority> {
+    priority_str.as_ref().and_then(|p| match p.to_lowercase().as_str() {
+        "high" => Some(MessagePriority::High),
+        "normal" => Some(MessagePriority::Normal),
+        "low" => Some(MessagePriority::Low),
+        _ => None,
+    })
 }
 
 async fn push_queue_handler(
@@ -264,19 +384,40 @@ async fn push_queue_handler(
     Query(params): Query<QueueParams>,
     body: String,
 ) -> impl IntoResponse {
+    // Check authentication
+    if let Err(status) = check_auth(&state, params.token.as_ref()) {
+        return (status, "Unauthorized").into_response();
+    }
+    
     state.metrics.increment(REQ_QUEUE_PUSH);
-    let (payload, body_ttl) = parse_payload(body);
-    let msg = Message::new(payload);
+    let (payload, body_ttl, body_priority) = parse_payload(body);
+    
+    // Parse priority from query param (takes precedence) or body
+    let priority = parse_priority(params.priority.as_ref())
+        .or_else(|| parse_priority(body_priority.as_ref()));
+    
+    let msg = if let Some(prio) = priority {
+        Message::with_priority(payload, Some(prio))
+    } else {
+        Message::new(payload)
+    };
+    
     state
         .engine
         .push_queue(&name, msg.clone(), body_ttl.or(params.ttl_seconds));
-    Json(serde_json::json!({ "status": "ok", "id": msg.id }))
+    Json(serde_json::json!({ "status": "ok", "id": msg.id })).into_response()
 }
 
 async fn pop_queue_handler(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
+    Query(params): Query<QueueParams>,
 ) -> impl IntoResponse {
+    // Check authentication
+    if let Err(status) = check_auth(&state, params.token.as_ref()) {
+        return (status, "Unauthorized").into_response();
+    }
+    
     state.metrics.increment(REQ_QUEUE_POP);
     if let Some(msg) = state.engine.pop_queue(&name) {
         Json(msg).into_response()
@@ -361,9 +502,9 @@ async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoRespons
     Json(response)
 }
 
-fn parse_payload(body: String) -> (String, Option<u64>) {
+fn parse_payload(body: String) -> (String, Option<u64>, Option<String>) {
     match serde_json::from_str::<PayloadRequest>(&body) {
-        Ok(request) => (request.payload, request.ttl_seconds),
-        Err(_) => (body, None),
+        Ok(request) => (request.payload, request.ttl_seconds, request.priority),
+        Err(_) => (body, None, None),
     }
 }

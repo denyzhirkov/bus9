@@ -4,11 +4,20 @@ use tokio::sync::broadcast;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MessagePriority {
+    Low,
+    Normal,
+    High,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Message {
     pub id: String,
     pub payload: String, // Keep text for simplicity in MVP, or Vec<u8> with base64
     pub timestamp: u64,
+    #[serde(default)]
+    pub priority: Option<MessagePriority>,
 }
 
 impl Message {
@@ -17,14 +26,27 @@ impl Message {
             id: uuid::Uuid::new_v4().to_string(),
             payload,
             timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64,
+            priority: None, // Default to Normal (None = Normal)
+        }
+    }
+    
+    pub fn with_priority(payload: String, priority: Option<MessagePriority>) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            payload,
+            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64,
+            priority,
         }
     }
 }
 
-#[derive(Clone, Debug, Copy)]
+#[derive(Clone, Debug)]
 pub struct EngineConfig {
     pub broadcast_channel_capacity: usize,
     pub max_expired_events: usize,
+    pub topic_replay_count: usize,
+    pub inactivity_timeout_seconds: Option<u64>,
+    pub topic_exclude_patterns: Vec<String>,
 }
 
 impl Default for EngineConfig {
@@ -32,6 +54,9 @@ impl Default for EngineConfig {
         Self {
             broadcast_channel_capacity: 1024,
             max_expired_events: 50,
+            topic_replay_count: 0,
+            inactivity_timeout_seconds: None,
+            topic_exclude_patterns: Vec::new(),
         }
     }
 }
@@ -43,17 +68,60 @@ pub struct Engine {
     // Queue: Point-to-Point
     pub queues: RwLock<HashMap<String, QueueEntry>>,
     expired_events: RwLock<Vec<ExpiredEntry>>,
+    // Pattern subscriptions: pattern -> list of matching topics
+    pattern_subscriptions: RwLock<HashMap<String, Vec<String>>>,
 }
 
 #[derive(Clone)]
 pub struct TopicEntry {
     pub sender: broadcast::Sender<Message>,
     pub meta: EntryMeta,
+    pub message_history: VecDeque<Message>,
+}
+
+#[derive(Clone)]
+pub struct PriorityQueues {
+    pub high: VecDeque<Message>,
+    pub normal: VecDeque<Message>,
+    pub low: VecDeque<Message>,
+}
+
+impl PriorityQueues {
+    fn new() -> Self {
+        Self {
+            high: VecDeque::new(),
+            normal: VecDeque::new(),
+            low: VecDeque::new(),
+        }
+    }
+    
+    fn total_len(&self) -> usize {
+        self.high.len() + self.normal.len() + self.low.len()
+    }
+    
+    fn push(&mut self, msg: Message) {
+        let priority = msg.priority.as_ref().unwrap_or(&MessagePriority::Normal);
+        match priority {
+            MessagePriority::High => self.high.push_back(msg),
+            MessagePriority::Normal => self.normal.push_back(msg),
+            MessagePriority::Low => self.low.push_back(msg),
+        }
+    }
+    
+    fn pop(&mut self) -> Option<Message> {
+        if let Some(msg) = self.high.pop_front() {
+            return Some(msg);
+        }
+        if let Some(msg) = self.normal.pop_front() {
+            return Some(msg);
+        }
+        self.low.pop_front()
+    }
 }
 
 #[derive(Clone)]
 pub struct QueueEntry {
-    pub messages: VecDeque<Message>,
+    pub messages: PriorityQueues,
     pub meta: EntryMeta,
 }
 
@@ -83,6 +151,7 @@ pub struct ExpiredEntry {
     pub name: String,
     pub kind: String,
     pub expired_at: u64,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -99,56 +168,93 @@ impl Engine {
             topics: RwLock::new(HashMap::new()),
             queues: RwLock::new(HashMap::new()),
             expired_events: RwLock::new(Vec::new()),
+            pattern_subscriptions: RwLock::new(HashMap::new()),
         }
+    }
+    
+    /// Get a reference to the engine config
+    pub fn config(&self) -> &EngineConfig {
+        &self.config
     }
 
     pub fn publish(&self, topic: &str, msg: Message, ttl_seconds: Option<u64>) -> usize {
         let mut topics = self.topics.write();
+        let is_new_topic = !topics.contains_key(topic);
+        
         if let Some(entry) = topics.get_mut(topic) {
             entry.meta.touch();
+            // Save to history if replay is enabled
+            if self.config.topic_replay_count > 0 {
+                entry.message_history.push_back(msg.clone());
+                // Limit history size
+                while entry.message_history.len() > self.config.topic_replay_count {
+                    entry.message_history.pop_front();
+                }
+            }
             entry.sender.send(msg).unwrap_or(0)
         } else {
             let (tx, _rx) = broadcast::channel(self.config.broadcast_channel_capacity);
-            let count = tx.send(msg).unwrap_or(0);
+            let count = tx.send(msg.clone()).unwrap_or(0);
+            let mut history = VecDeque::new();
+            // Save to history if replay is enabled
+            if self.config.topic_replay_count > 0 {
+                history.push_back(msg);
+            }
             topics.insert(
                 topic.to_string(),
                 TopicEntry {
                     sender: tx,
                     meta: EntryMeta::new(ttl_seconds),
+                    message_history: history,
                 },
             );
+            
+            // If this is a new topic, check if it matches any active pattern subscriptions
+            if is_new_topic {
+                drop(topics); // Release write lock
+                let patterns = self.pattern_subscriptions.read();
+                for (pattern, _) in patterns.iter() {
+                    if matches_pattern(topic, pattern) {
+                        // Topic matches a pattern, but subscribers will get it via their existing receivers
+                        // No action needed as broadcast channels handle this automatically
+                    }
+                }
+            }
+            
             count
         }
     }
     
-    pub fn subscribe(&self, topic: &str, ttl_seconds: Option<u64>) -> broadcast::Receiver<Message> {
+    pub fn subscribe(&self, topic: &str, ttl_seconds: Option<u64>) -> (broadcast::Receiver<Message>, Vec<Message>) {
         let mut topics = self.topics.write();
         let entry = topics.entry(topic.to_string()).or_insert_with(|| {
             let (tx, _rx) = broadcast::channel(self.config.broadcast_channel_capacity);
             TopicEntry {
                 sender: tx,
                 meta: EntryMeta::new(ttl_seconds),
+                message_history: VecDeque::new(),
             }
         });
         entry.meta.touch();
-        entry.sender.subscribe()
+        let history: Vec<Message> = entry.message_history.iter().cloned().collect();
+        (entry.sender.subscribe(), history)
     }
 
     pub fn push_queue(&self, queue: &str, msg: Message, ttl_seconds: Option<u64>) {
         let mut queues = self.queues.write();
         let entry = queues.entry(queue.to_string()).or_insert_with(|| QueueEntry {
-            messages: VecDeque::new(),
+            messages: PriorityQueues::new(),
             meta: EntryMeta::new(ttl_seconds),
         });
         entry.meta.touch();
-        entry.messages.push_back(msg);
+        entry.messages.push(msg);
     }
     
     pub fn pop_queue(&self, queue: &str) -> Option<Message> {
         let mut queues = self.queues.write();
         queues.get_mut(queue).and_then(|entry| {
             entry.meta.touch();
-            entry.messages.pop_front()
+            entry.messages.pop()
         })
     }
 
@@ -165,7 +271,7 @@ impl Engine {
             .collect();
         let queue_stats: HashMap<_, _> = queues
             .iter()
-            .map(|(k, v)| (k.clone(), QueueStatus::new(v.messages.len(), &v.meta)))
+            .map(|(k, v)| (k.clone(), QueueStatus::new(v.messages.total_len(), &v.meta)))
             .collect();
         
         BrokerSnapshot {
@@ -181,34 +287,62 @@ impl Engine {
 
         {
             let mut topics = self.topics.write();
-            let expired_topics: Vec<String> = topics
+            let expired_topics: Vec<(String, String)> = topics
                 .iter()
-                .filter(|(_, entry)| entry.meta.is_expired(now))
-                .map(|(name, _)| name.clone())
+                .filter_map(|(name, entry)| {
+                    let reason = if entry.meta.is_expired(now) {
+                        Some("ttl".to_string())
+                    } else if let Some(timeout) = self.config.inactivity_timeout_seconds {
+                        let inactive_ms = now.saturating_sub(entry.meta.last_activity);
+                        if inactive_ms >= timeout.saturating_mul(1000) {
+                            Some("inactivity".to_string())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    reason.map(|r| (name.clone(), r))
+                })
                 .collect();
-            for name in expired_topics {
+            for (name, reason) in expired_topics {
                 topics.remove(&name);
                 expired_entries.push(ExpiredEntry {
                     name,
                     kind: "topic".to_string(),
                     expired_at: now,
+                    reason,
                 });
             }
         }
 
         {
             let mut queues = self.queues.write();
-            let expired_queues: Vec<String> = queues
+            let expired_queues: Vec<(String, String)> = queues
                 .iter()
-                .filter(|(_, entry)| entry.meta.is_expired(now))
-                .map(|(name, _)| name.clone())
+                .filter_map(|(name, entry)| {
+                    let reason = if entry.meta.is_expired(now) {
+                        Some("ttl".to_string())
+                    } else if let Some(timeout) = self.config.inactivity_timeout_seconds {
+                        let inactive_ms = now.saturating_sub(entry.meta.last_activity);
+                        if inactive_ms >= timeout.saturating_mul(1000) {
+                            Some("inactivity".to_string())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    reason.map(|r| (name.clone(), r))
+                })
                 .collect();
-            for name in expired_queues {
+            for (name, reason) in expired_queues {
                 queues.remove(&name);
                 expired_entries.push(ExpiredEntry {
                     name,
                     kind: "queue".to_string(),
                     expired_at: now,
+                    reason,
                 });
             }
         }
@@ -225,6 +359,55 @@ impl Engine {
 
     pub fn get_metrics(&self) -> BrokerSnapshot {
         self.get_stats()
+    }
+
+    /// Check if a topic is excluded from pattern matching
+    fn is_topic_excluded(&self, topic: &str) -> bool {
+        for exclude_pattern in &self.config.topic_exclude_patterns {
+            if matches_pattern(topic, exclude_pattern) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Find all topics matching a pattern (excluding topics that match exclude patterns)
+    pub fn find_matching_topics(&self, pattern: &str) -> Vec<String> {
+        let topics = self.topics.read();
+        topics
+            .keys()
+            .filter(|topic| {
+                // Must match the pattern
+                matches_pattern(topic, pattern) &&
+                // And must not be excluded
+                !self.is_topic_excluded(topic)
+            })
+            .cloned()
+            .collect()
+    }
+    
+    /// Subscribe to a pattern and return receivers for all matching topics
+    pub fn subscribe_pattern(&self, pattern: &str, ttl_seconds: Option<u64>) -> Vec<(String, broadcast::Receiver<Message>, Vec<Message>)> {
+        let matching_topics = self.find_matching_topics(pattern);
+        let mut subscriptions = Vec::new();
+        
+        for topic in matching_topics {
+            let (rx, history) = self.subscribe(&topic, ttl_seconds);
+            subscriptions.push((topic, rx, history));
+        }
+        
+        // Track this pattern subscription
+        {
+            let mut patterns = self.pattern_subscriptions.write();
+            patterns.insert(pattern.to_string(), self.find_matching_topics(pattern));
+        }
+        
+        subscriptions
+    }
+    
+    /// Check if a string is a pattern (contains * or **)
+    pub fn is_pattern(&self, s: &str) -> bool {
+        s.contains('*')
     }
 }
 
@@ -279,4 +462,49 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64
+}
+
+/// Check if a topic name matches a pattern
+/// Supports:
+/// - `*` matches a single segment (e.g., `sensor.*` matches `sensor.temp` but not `sensor.room.temp`)
+/// - `**` matches any path (e.g., `logs.**` matches `logs.app.error`, `logs.system.info`)
+pub fn matches_pattern(topic: &str, pattern: &str) -> bool {
+    if pattern == topic {
+        return true;
+    }
+    
+    // Handle ** (match any path)
+    if pattern.contains("**") {
+        let parts: Vec<&str> = pattern.split("**").collect();
+        if parts.len() == 2 {
+            let prefix = parts[0];
+            let suffix = parts[1];
+            if prefix.is_empty() && suffix.is_empty() {
+                return true; // ** matches everything
+            }
+            if prefix.is_empty() {
+                return topic.ends_with(suffix);
+            }
+            if suffix.is_empty() {
+                return topic.starts_with(prefix);
+            }
+            return topic.starts_with(prefix) && topic.ends_with(suffix);
+        }
+    }
+    
+    // Handle * (match single segment)
+    let pattern_parts: Vec<&str> = pattern.split('.').collect();
+    let topic_parts: Vec<&str> = topic.split('.').collect();
+    
+    if pattern_parts.len() != topic_parts.len() {
+        return false;
+    }
+    
+    for (pattern_part, topic_part) in pattern_parts.iter().zip(topic_parts.iter()) {
+        if *pattern_part != "*" && pattern_part != topic_part {
+            return false;
+        }
+    }
+    
+    true
 }
