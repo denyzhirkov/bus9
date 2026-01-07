@@ -1,11 +1,23 @@
 import { useEffect, useState, useRef } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { Activity, Radio, Server, Boxes, Send } from 'lucide-react'
+import { Activity, Radio, Server, Boxes, Send, BarChart3 } from 'lucide-react'
 import './index.css'
 
 interface Stats {
   topics: Record<string, number>
   queues: Record<string, number>
+}
+
+interface MetricsResponse {
+  requests: Record<string, number>
+  topics: {
+    active: number
+    subscribers: Record<string, number>
+  }
+  queues: {
+    active: number
+    depth: Record<string, number>
+  }
 }
 
 interface LogMessage {
@@ -16,6 +28,12 @@ interface LogMessage {
 
 function App() {
   const [stats, setStats] = useState<Stats>({ topics: {}, queues: {} })
+  const [metrics, setMetrics] = useState<MetricsResponse>({
+    requests: {},
+    topics: { active: 0, subscribers: {} },
+    queues: { active: 0, depth: {} },
+  })
+  const [requestHistory, setRequestHistory] = useState<number[]>([])
   const [msgInput, setMsgInput] = useState('')
   const [target, setTarget] = useState('')
   const [mode, setMode] = useState<'pub' | 'queue'>('pub')
@@ -36,6 +54,31 @@ function App() {
     }
 
     return () => ws.close()
+  }, [])
+
+  useEffect(() => {
+    let active = true
+
+    const fetchMetrics = async () => {
+      try {
+        const response = await fetch('/api/metrics')
+        if (!response.ok) return
+        const data: MetricsResponse = await response.json()
+        if (!active) return
+        setMetrics(data)
+        const totalRequests = Object.values(data.requests).reduce((sum, value) => sum + value, 0)
+        setRequestHistory(prev => [...prev, totalRequests].slice(-24))
+      } catch (error) {
+        console.error(error)
+      }
+    }
+
+    fetchMetrics()
+    const intervalId = window.setInterval(fetchMetrics, 1000)
+    return () => {
+      active = false
+      window.clearInterval(intervalId)
+    }
   }, [])
 
   useEffect(() => {
@@ -67,6 +110,19 @@ function App() {
     setMsgInput('')
   }
 
+  const requestEntries = Object.entries(metrics.requests).sort((a, b) => b[1] - a[1])
+  const subscriberEntries = Object.entries(metrics.topics.subscribers).sort((a, b) => b[1] - a[1])
+  const queueEntries = Object.entries(metrics.queues.depth).sort((a, b) => b[1] - a[1])
+
+  const totalRequests = requestEntries.reduce((sum, [, value]) => sum + value, 0)
+  const totalSubscribers = subscriberEntries.reduce((sum, [, value]) => sum + value, 0)
+  const totalQueueDepth = queueEntries.reduce((sum, [, value]) => sum + value, 0)
+
+  const maxRequest = Math.max(1, ...requestEntries.map(([, value]) => value))
+  const maxSubscribers = Math.max(1, ...subscriberEntries.map(([, value]) => value))
+  const maxQueueDepth = Math.max(1, ...queueEntries.map(([, value]) => value))
+  const maxHistory = Math.max(1, ...requestHistory)
+
   return (
     <div style={{ padding: '2rem', maxWidth: '1200px', margin: '0 auto' }}>
       <header style={{ marginBottom: '3rem', display: 'flex', alignItems: 'center', gap: '1rem' }}>
@@ -80,6 +136,111 @@ function App() {
       </header>
 
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '2rem' }}>
+
+        {/* Metrics */}
+        <div className="panel" style={{ gridColumn: 'span 2', display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
+          <h2 style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginTop: 0 }}>
+            <BarChart3 size={20} /> Live Metrics
+          </h2>
+
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '1rem' }}>
+            <div style={{ border: '1px solid var(--border-color)', borderRadius: 12, padding: '1rem', background: 'rgba(255,255,255,0.02)' }}>
+              <div style={{ fontSize: '0.85em', color: 'var(--text-secondary)' }}>Total Requests</div>
+              <div style={{ fontSize: '1.6rem', fontWeight: 600 }}>{totalRequests.toLocaleString()}</div>
+              <div style={{ display: 'flex', alignItems: 'flex-end', gap: 4, height: 40, marginTop: '0.75rem' }}>
+                {requestHistory.map((value, index) => (
+                  <div
+                    key={`${value}-${index}`}
+                    style={{
+                      width: 6,
+                      height: `${(value / maxHistory) * 40}px`,
+                      borderRadius: 6,
+                      background: 'var(--accent-color)',
+                      opacity: 0.6,
+                    }}
+                  />
+                ))}
+                {requestHistory.length === 0 && (
+                  <div style={{ color: 'var(--text-secondary)', fontSize: '0.8em' }}>Waiting for traffic...</div>
+                )}
+              </div>
+            </div>
+
+            <div style={{ border: '1px solid var(--border-color)', borderRadius: 12, padding: '1rem', background: 'rgba(255,255,255,0.02)' }}>
+              <div style={{ fontSize: '0.85em', color: 'var(--text-secondary)' }}>Active Topics</div>
+              <div style={{ fontSize: '1.6rem', fontWeight: 600 }}>{metrics.topics.active}</div>
+              <div style={{ marginTop: '0.5rem', color: 'var(--text-secondary)' }}>{totalSubscribers} total subscribers</div>
+            </div>
+
+            <div style={{ border: '1px solid var(--border-color)', borderRadius: 12, padding: '1rem', background: 'rgba(255,255,255,0.02)' }}>
+              <div style={{ fontSize: '0.85em', color: 'var(--text-secondary)' }}>Active Queues</div>
+              <div style={{ fontSize: '1.6rem', fontWeight: 600 }}>{metrics.queues.active}</div>
+              <div style={{ marginTop: '0.5rem', color: 'var(--text-secondary)' }}>{totalQueueDepth} messages queued</div>
+            </div>
+
+            <div style={{ border: '1px solid var(--border-color)', borderRadius: 12, padding: '1rem', background: 'rgba(255,255,255,0.02)' }}>
+              <div style={{ fontSize: '0.85em', color: 'var(--text-secondary)' }}>Top Endpoint</div>
+              {requestEntries.length === 0 ? (
+                <div style={{ color: 'var(--text-secondary)', marginTop: '0.5rem' }}>No requests yet</div>
+              ) : (
+                <>
+                  <div style={{ fontSize: '1.4rem', fontWeight: 600 }}>{requestEntries[0][1].toLocaleString()}</div>
+                  <div style={{ color: 'var(--text-secondary)' }}>{requestEntries[0][0]}</div>
+                </>
+              )}
+            </div>
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: '1rem' }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+              <h3 style={{ margin: 0, fontSize: '1rem' }}>Requests per Endpoint</h3>
+              {requestEntries.length === 0 && <span style={{ opacity: 0.6 }}>Waiting for requests...</span>}
+              {requestEntries.map(([name, value]) => (
+                <div key={name} style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.85em', color: 'var(--text-secondary)' }}>
+                    <span>{name}</span>
+                    <span>{value}</span>
+                  </div>
+                  <div style={{ height: 6, background: 'rgba(255,255,255,0.08)', borderRadius: 999 }}>
+                    <div style={{ height: '100%', width: `${(value / maxRequest) * 100}%`, background: 'var(--accent-color)', borderRadius: 999 }} />
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+              <h3 style={{ margin: 0, fontSize: '1rem' }}>Subscribers by Topic</h3>
+              {subscriberEntries.length === 0 && <span style={{ opacity: 0.6 }}>No subscribers yet</span>}
+              {subscriberEntries.map(([name, value]) => (
+                <div key={name} style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.85em', color: 'var(--text-secondary)' }}>
+                    <span>{name}</span>
+                    <span>{value}</span>
+                  </div>
+                  <div style={{ height: 6, background: 'rgba(255,255,255,0.08)', borderRadius: 999 }}>
+                    <div style={{ height: '100%', width: `${(value / maxSubscribers) * 100}%`, background: 'var(--success-color)', borderRadius: 999 }} />
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+              <h3 style={{ margin: 0, fontSize: '1rem' }}>Queue Depth</h3>
+              {queueEntries.length === 0 && <span style={{ opacity: 0.6 }}>No queues yet</span>}
+              {queueEntries.map(([name, value]) => (
+                <div key={name} style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.85em', color: 'var(--text-secondary)' }}>
+                    <span>{name}</span>
+                    <span>{value}</span>
+                  </div>
+                  <div style={{ height: 6, background: 'rgba(255,255,255,0.08)', borderRadius: 999 }}>
+                    <div style={{ height: '100%', width: `${(value / maxQueueDepth) * 100}%`, background: 'var(--accent-color)', borderRadius: 999 }} />
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
 
         {/* Topology Stats */}
         <div className="panel" style={{ gridColumn: 'span 2', display: 'flex', gap: '2rem', flexDirection: 'row', flexWrap: 'wrap' }}>

@@ -8,7 +8,9 @@ use axum::{
 use rust_embed::RustEmbed;
 use std::{net::SocketAddr, sync::Arc};
 use tokio::net::TcpListener;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use parking_lot::RwLock;
 
 mod engine;
 use engine::{Engine, Message};
@@ -19,6 +21,47 @@ struct Assets;
 
 struct AppState {
     engine: Arc<Engine>,
+    metrics: MetricsStore,
+}
+
+struct MetricsStore {
+    requests: RwLock<HashMap<String, u64>>,
+}
+
+impl MetricsStore {
+    fn new() -> Self {
+        Self {
+            requests: RwLock::new(HashMap::new()),
+        }
+    }
+
+    fn increment(&self, key: &str) {
+        let mut requests = self.requests.write();
+        *requests.entry(key.to_string()).or_insert(0) += 1;
+    }
+
+    fn snapshot(&self) -> HashMap<String, u64> {
+        self.requests.read().clone()
+    }
+}
+
+#[derive(Serialize)]
+struct MetricsResponse {
+    requests: HashMap<String, u64>,
+    topics: TopicMetrics,
+    queues: QueueMetrics,
+}
+
+#[derive(Serialize)]
+struct TopicMetrics {
+    active: usize,
+    subscribers: HashMap<String, usize>,
+}
+
+#[derive(Serialize)]
+struct QueueMetrics {
+    active: usize,
+    depth: HashMap<String, usize>,
 }
 
 #[tokio::main]
@@ -26,7 +69,8 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     let engine = Arc::new(Engine::new());
-    let state = Arc::new(AppState { engine });
+    let metrics = MetricsStore::new();
+    let state = Arc::new(AppState { engine, metrics });
 
     let app = Router::new()
         .route("/health", get(health_handler))
@@ -35,6 +79,7 @@ async fn main() {
         .route("/api/queue/:name", post(push_queue_handler).get(pop_queue_handler))
         .route("/api/stats", get(stats_handler))
         .route("/api/ws/stats", get(stats_ws_handler))
+        .route("/api/metrics", get(metrics_handler))
         .fallback(static_handler)
         .with_state(state);
 
@@ -85,7 +130,17 @@ async fn shutdown_signal() {
     println!("Signal received, starting graceful shutdown...");
 }
 
-async fn health_handler() -> &'static str {
+const REQ_HEALTH: &str = "GET /health";
+const REQ_PUB: &str = "POST /api/pub";
+const REQ_SUB: &str = "GET /api/sub";
+const REQ_QUEUE_PUSH: &str = "POST /api/queue";
+const REQ_QUEUE_POP: &str = "GET /api/queue";
+const REQ_STATS: &str = "GET /api/stats";
+const REQ_STATS_WS: &str = "GET /api/ws/stats";
+const REQ_METRICS: &str = "GET /api/metrics";
+
+async fn health_handler(State(state): State<Arc<AppState>>) -> &'static str {
+    state.metrics.increment(REQ_HEALTH);
     "OK"
 }
 
@@ -99,6 +154,7 @@ async fn publish_handler(
     Query(params): Query<PublishParams>,
     body: String,
 ) -> impl IntoResponse {
+    state.metrics.increment(REQ_PUB);
     let msg = Message::new(body);
     let count = state.engine.publish(&params.topic, msg.clone());
     Json(serde_json::json!({ "count": count, "id": msg.id }))
@@ -109,6 +165,7 @@ async fn subscribe_handler(
     Query(params): Query<PublishParams>,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
+    state.metrics.increment(REQ_SUB);
     ws.on_upgrade(move |socket| handle_socket(socket, state, params.topic))
 }
 
@@ -127,6 +184,7 @@ async fn push_queue_handler(
     Path(name): Path<String>,
     body: String,
 ) -> impl IntoResponse {
+    state.metrics.increment(REQ_QUEUE_PUSH);
     let msg = Message::new(body);
     state.engine.push_queue(&name, msg.clone());
     Json(serde_json::json!({ "status": "ok", "id": msg.id }))
@@ -136,6 +194,7 @@ async fn pop_queue_handler(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
+    state.metrics.increment(REQ_QUEUE_POP);
     if let Some(msg) = state.engine.pop_queue(&name) {
         Json(msg).into_response()
     } else {
@@ -144,6 +203,7 @@ async fn pop_queue_handler(
 }
 
 async fn stats_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    state.metrics.increment(REQ_STATS);
     Json(state.engine.get_stats())
 }
 
@@ -182,6 +242,7 @@ async fn stats_ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
+    state.metrics.increment(REQ_STATS_WS);
     ws.on_upgrade(|socket| handle_stats_socket(socket, state))
 }
 
@@ -196,4 +257,22 @@ async fn handle_stats_socket(mut socket: WebSocket, state: Arc<AppState>) {
             break;
         }
     }
+}
+
+async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    state.metrics.increment(REQ_METRICS);
+    let broker_metrics = state.engine.get_metrics();
+    let response = MetricsResponse {
+        requests: state.metrics.snapshot(),
+        topics: TopicMetrics {
+            active: broker_metrics.topic_subscribers.len(),
+            subscribers: broker_metrics.topic_subscribers,
+        },
+        queues: QueueMetrics {
+            active: broker_metrics.queue_depths.len(),
+            depth: broker_metrics.queue_depths,
+        },
+    };
+
+    Json(response)
 }

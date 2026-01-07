@@ -28,6 +28,11 @@ pub struct Engine {
     pub queues: RwLock<HashMap<String, VecDeque<Message>>>,
 }
 
+pub struct BrokerMetrics {
+    pub topic_subscribers: HashMap<String, usize>,
+    pub queue_depths: HashMap<String, usize>,
+}
+
 impl Engine {
     pub fn new() -> Self {
         Self {
@@ -78,5 +83,20 @@ impl Engine {
             "topics": topic_stats,
             "queues": queue_stats
         })
+    }
+
+    pub fn get_metrics(&self) -> BrokerMetrics {
+        let topics = self.topics.read();
+        let queues = self.queues.read();
+
+        let topic_subscribers: HashMap<_, _> =
+            topics.iter().map(|(k, v)| (k.clone(), v.receiver_count())).collect();
+        let queue_depths: HashMap<_, _> =
+            queues.iter().map(|(k, v)| (k.clone(), v.len())).collect();
+
+        BrokerMetrics {
+            topic_subscribers,
+            queue_depths,
+        }
     }
 }
