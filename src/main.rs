@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use parking_lot::RwLock;
 
 mod engine;
-use engine::{Engine, Message};
+use engine::{Engine, ExpiredEntry, Message, QueueStatus, TopicStatus};
 
 #[derive(RustEmbed)]
 #[folder = "front/dist"]
@@ -50,18 +50,19 @@ struct MetricsResponse {
     requests: HashMap<String, u64>,
     topics: TopicMetrics,
     queues: QueueMetrics,
+    expired: Vec<ExpiredEntry>,
 }
 
 #[derive(Serialize)]
 struct TopicMetrics {
     active: usize,
-    subscribers: HashMap<String, usize>,
+    entries: HashMap<String, TopicStatus>,
 }
 
 #[derive(Serialize)]
 struct QueueMetrics {
     active: usize,
-    depth: HashMap<String, usize>,
+    entries: HashMap<String, QueueStatus>,
 }
 
 #[tokio::main]
@@ -69,6 +70,14 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     let engine = Arc::new(Engine::new());
+    let sweep_engine = Arc::clone(&engine);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            sweep_engine.sweep_expired();
+        }
+    });
     let metrics = MetricsStore::new();
     let state = Arc::new(AppState { engine, metrics });
 
@@ -147,6 +156,18 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> &'static str {
 #[derive(Deserialize)]
 struct PublishParams {
     topic: String,
+    ttl_seconds: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct QueueParams {
+    ttl_seconds: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct PayloadRequest {
+    payload: String,
+    ttl_seconds: Option<u64>,
 }
 
 async fn publish_handler(
@@ -155,8 +176,11 @@ async fn publish_handler(
     body: String,
 ) -> impl IntoResponse {
     state.metrics.increment(REQ_PUB);
-    let msg = Message::new(body);
-    let count = state.engine.publish(&params.topic, msg.clone());
+    let (payload, body_ttl) = parse_payload(body);
+    let msg = Message::new(payload);
+    let count = state
+        .engine
+        .publish(&params.topic, msg.clone(), body_ttl.or(params.ttl_seconds));
     Json(serde_json::json!({ "count": count, "id": msg.id }))
 }
 
@@ -166,11 +190,16 @@ async fn subscribe_handler(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
     state.metrics.increment(REQ_SUB);
-    ws.on_upgrade(move |socket| handle_socket(socket, state, params.topic))
+    ws.on_upgrade(move |socket| handle_socket(socket, state, params.topic, params.ttl_seconds))
 }
 
-async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, topic: String) {
-    let mut rx = state.engine.subscribe(&topic);
+async fn handle_socket(
+    mut socket: WebSocket,
+    state: Arc<AppState>,
+    topic: String,
+    ttl_seconds: Option<u64>,
+) {
+    let mut rx = state.engine.subscribe(&topic, ttl_seconds);
     while let Ok(msg) = rx.recv().await {
         let text = serde_json::to_string(&msg).unwrap();
         if socket.send(axum::extract::ws::Message::Text(text.into())).await.is_err() {
@@ -182,11 +211,15 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, topic: Strin
 async fn push_queue_handler(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
+    Query(params): Query<QueueParams>,
     body: String,
 ) -> impl IntoResponse {
     state.metrics.increment(REQ_QUEUE_PUSH);
-    let msg = Message::new(body);
-    state.engine.push_queue(&name, msg.clone());
+    let (payload, body_ttl) = parse_payload(body);
+    let msg = Message::new(payload);
+    state
+        .engine
+        .push_queue(&name, msg.clone(), body_ttl.or(params.ttl_seconds));
     Json(serde_json::json!({ "status": "ok", "id": msg.id }))
 }
 
@@ -265,14 +298,22 @@ async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoRespons
     let response = MetricsResponse {
         requests: state.metrics.snapshot(),
         topics: TopicMetrics {
-            active: broker_metrics.topic_subscribers.len(),
-            subscribers: broker_metrics.topic_subscribers,
+            active: broker_metrics.topics.len(),
+            entries: broker_metrics.topics,
         },
         queues: QueueMetrics {
-            active: broker_metrics.queue_depths.len(),
-            depth: broker_metrics.queue_depths,
+            active: broker_metrics.queues.len(),
+            entries: broker_metrics.queues,
         },
+        expired: broker_metrics.expired,
     };
 
     Json(response)
+}
+
+fn parse_payload(body: String) -> (String, Option<u64>) {
+    match serde_json::from_str::<PayloadRequest>(&body) {
+        Ok(request) => (request.payload, request.ttl_seconds),
+        Err(_) => (body, None),
+    }
 }
