@@ -12,6 +12,7 @@ use tokio::net::TcpListener;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use parking_lot::RwLock;
+use tracing::{error, warn};
 
 mod engine;
 use engine::{Engine, EngineConfig, ExpiredEntry, Message, MessagePriority, QueueStatus, TopicStatus};
@@ -60,6 +61,26 @@ struct AppArgs {
     /// Token must be provided as query parameter: ?token=<token>
     #[arg(long, env = "BUS9_AUTH_TOKEN")]
     auth_token: Option<String>,
+
+    /// Maximum payload size in bytes (0 = unlimited)
+    #[arg(long, env = "BUS9_MAX_PAYLOAD_SIZE", default_value_t = 10 * 1024 * 1024)]
+    max_payload_size: usize,
+
+    /// Maximum topic/queue name length in characters (0 = unlimited)
+    #[arg(long, env = "BUS9_MAX_NAME_LENGTH", default_value_t = 256)]
+    max_name_length: usize,
+
+    /// Maximum number of topics (0 = unlimited)
+    #[arg(long, env = "BUS9_MAX_TOPICS", default_value_t = 0)]
+    max_topics: usize,
+
+    /// Maximum number of queues (0 = unlimited)
+    #[arg(long, env = "BUS9_MAX_QUEUES", default_value_t = 0)]
+    max_queues: usize,
+
+    /// Maximum queue depth (0 = unlimited)
+    #[arg(long, env = "BUS9_MAX_QUEUE_DEPTH", default_value_t = 0)]
+    max_queue_depth: usize,
 }
 
 #[derive(RustEmbed)]
@@ -129,6 +150,11 @@ async fn main() {
         topic_replay_count: args.topic_replay_count,
         inactivity_timeout_seconds: args.inactivity_timeout_seconds,
         topic_exclude_patterns: args.topic_exclude_patterns,
+        max_payload_size: args.max_payload_size,
+        max_name_length: args.max_name_length,
+        max_topics: args.max_topics,
+        max_queues: args.max_queues,
+        max_queue_depth: args.max_queue_depth,
     };
 
     let engine = Arc::new(Engine::new(engine_config));
@@ -163,14 +189,20 @@ async fn main() {
         .fallback(static_handler)
         .with_state(state);
 
-    let addr: SocketAddr = format!("{}:{}", args.host, args.port)
-        .parse()
-        .expect("Invalid address format");
+    let addr: SocketAddr = match format!("{}:{}", args.host, args.port).parse() {
+        Ok(addr) => addr,
+        Err(e) => {
+            error!("Invalid address format '{}:{}': {}", args.host, args.port, e);
+            eprintln!("Error: Invalid address format '{}:{}': {}", args.host, args.port, e);
+            std::process::exit(1);
+        }
+    };
     println!("Listening on http://{}", addr);
     
     let listener = match TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) => {
+            error!("Could not bind to address {}: {}", addr, e);
             eprintln!("Error: Could not bind to address {}: {}", addr, e);
             std::process::exit(1);
         }
@@ -188,17 +220,27 @@ async fn main() {
 
 async fn shutdown_signal() {
     let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
+        match tokio::signal::ctrl_c().await {
+            Ok(_) => {}
+            Err(e) => {
+                error!("Failed to install Ctrl+C handler: {}", e);
+                // Continue anyway, server will run without graceful shutdown
+            }
+        }
     };
 
     #[cfg(unix)]
     let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install signal handler")
-            .recv()
-            .await;
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(e) => {
+                error!("Failed to install terminate signal handler: {}", e);
+                // Wait forever to prevent shutdown
+                std::future::pending::<()>().await;
+            }
+        }
     };
 
     #[cfg(not(unix))]
@@ -274,10 +316,14 @@ async fn publish_handler(
     state.metrics.increment(REQ_PUB);
     let (payload, body_ttl, _) = parse_payload(body);
     let msg = Message::new(payload);
-    let count = state
-        .engine
-        .publish(&params.topic, msg.clone(), body_ttl.or(params.ttl_seconds));
-    Json(serde_json::json!({ "count": count, "id": msg.id })).into_response()
+    
+    match state.engine.publish(&params.topic, msg.clone(), body_ttl.or(params.ttl_seconds)) {
+        Ok(count) => Json(serde_json::json!({ "count": count, "id": msg.id })).into_response(),
+        Err(e) => {
+            warn!("Publish failed for topic '{}': {}", params.topic, e);
+            (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e }))).into_response()
+        }
+    }
 }
 
 async fn subscribe_handler(
@@ -301,16 +347,38 @@ async fn handle_socket(
     topic: String,
     ttl_seconds: Option<u64>,
 ) {
+    // Helper function to safely serialize and send message
+    async fn send_message(socket: &mut WebSocket, msg: &Message) -> Result<(), ()> {
+        match serde_json::to_string(msg) {
+            Ok(text) => {
+                socket.send(axum::extract::ws::Message::Text(text.into())).await.map_err(|_| ())
+            }
+            Err(e) => {
+                warn!("Failed to serialize message: {}", e);
+                Err(())
+            }
+        }
+    }
+
     // Check if this is a pattern subscription
     if topic.contains('*') {
         // Pattern-based subscription
-        let subscriptions = state.engine.subscribe_pattern(&topic, ttl_seconds);
+        let subscriptions = match state.engine.subscribe_pattern(&topic, ttl_seconds) {
+            Ok(subs) => subs,
+            Err(e) => {
+                warn!("Pattern subscription failed for '{}': {}", topic, e);
+                // Try to send error message to client
+                let _ = socket.send(axum::extract::ws::Message::Text(
+                    format!(r#"{{"error": "Subscription failed: {}"}}"#, e).into()
+                )).await;
+                return;
+            }
+        };
         
         // Send replay history for all matching topics
         for (_topic_name, _, history) in &subscriptions {
             for msg in history {
-                let text = serde_json::to_string(&msg).unwrap();
-                if socket.send(axum::extract::ws::Message::Text(text.into())).await.is_err() {
+                if send_message(&mut socket, msg).await.is_err() {
                     return;
                 }
             }
@@ -329,40 +397,57 @@ async fn handle_socket(
         let (tx, mut rx) = mpsc::unbounded_channel();
         
         // Spawn tasks to forward messages from each subscription
+        // Use a bounded channel or limit the number of tasks to prevent resource exhaustion
+        let mut task_handles = Vec::new();
         for (topic_name, mut receiver, _) in subscriptions {
             let tx_clone = tx.clone();
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 while let Ok(msg) = receiver.recv().await {
-                    let _ = tx_clone.send((topic_name.clone(), msg));
+                    if tx_clone.send((topic_name.clone(), msg)).is_err() {
+                        // Receiver dropped, exit
+                        break;
+                    }
                 }
             });
+            task_handles.push(handle);
         }
         drop(tx);
         
         // Forward merged messages to WebSocket
         while let Some((_topic_name, msg)) = rx.recv().await {
-            // Optionally include topic name in message
-            let text = serde_json::to_string(&msg).unwrap();
-            if socket.send(axum::extract::ws::Message::Text(text.into())).await.is_err() {
+            if send_message(&mut socket, &msg).await.is_err() {
                 break;
             }
         }
+        
+        // Cancel all tasks when connection closes
+        for handle in task_handles {
+            handle.abort();
+        }
     } else {
         // Regular single topic subscription
-        let (mut rx, history) = state.engine.subscribe(&topic, ttl_seconds);
+        let (mut rx, history) = match state.engine.subscribe(&topic, ttl_seconds) {
+            Ok(result) => result,
+            Err(e) => {
+                warn!("Subscription failed for topic '{}': {}", topic, e);
+                // Try to send error message to client
+                let _ = socket.send(axum::extract::ws::Message::Text(
+                    format!(r#"{{"error": "Subscription failed: {}"}}"#, e).into()
+                )).await;
+                return;
+            }
+        };
         
         // Send replay history first
         for msg in history {
-            let text = serde_json::to_string(&msg).unwrap();
-            if socket.send(axum::extract::ws::Message::Text(text.into())).await.is_err() {
+            if send_message(&mut socket, &msg).await.is_err() {
                 return;
             }
         }
         
         // Then send live messages
         while let Ok(msg) = rx.recv().await {
-            let text = serde_json::to_string(&msg).unwrap();
-            if socket.send(axum::extract::ws::Message::Text(text.into())).await.is_err() {
+            if send_message(&mut socket, &msg).await.is_err() {
                 break;
             }
         }
@@ -402,10 +487,13 @@ async fn push_queue_handler(
         Message::new(payload)
     };
     
-    state
-        .engine
-        .push_queue(&name, msg.clone(), body_ttl.or(params.ttl_seconds));
-    Json(serde_json::json!({ "status": "ok", "id": msg.id })).into_response()
+    match state.engine.push_queue(&name, msg.clone(), body_ttl.or(params.ttl_seconds)) {
+        Ok(()) => Json(serde_json::json!({ "status": "ok", "id": msg.id })).into_response(),
+        Err(e) => {
+            warn!("Queue push failed for queue '{}': {}", name, e);
+            (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e }))).into_response()
+        }
+    }
 }
 
 async fn pop_queue_handler(
@@ -475,10 +563,17 @@ async fn handle_stats_socket(mut socket: WebSocket, state: Arc<AppState>) {
     loop {
         interval.tick().await;
         let stats = state.engine.get_stats();
-        let text = serde_json::to_string(&stats).unwrap();
         
-        if socket.send(axum::extract::ws::Message::Text(text.into())).await.is_err() {
-            break;
+        match serde_json::to_string(&stats) {
+            Ok(text) => {
+                if socket.send(axum::extract::ws::Message::Text(text.into())).await.is_err() {
+                    break;
+                }
+            }
+            Err(e) => {
+                warn!("Failed to serialize stats: {}", e);
+                // Continue trying, don't break the connection
+            }
         }
     }
 }

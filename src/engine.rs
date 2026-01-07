@@ -3,6 +3,7 @@ use parking_lot::RwLock;
 use tokio::sync::broadcast;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::{error, warn};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MessagePriority {
@@ -25,7 +26,7 @@ impl Message {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             payload,
-            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64,
+            timestamp: now_ms_safe(),
             priority: None, // Default to Normal (None = Normal)
         }
     }
@@ -34,7 +35,7 @@ impl Message {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             payload,
-            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64,
+            timestamp: now_ms_safe(),
             priority,
         }
     }
@@ -47,6 +48,16 @@ pub struct EngineConfig {
     pub topic_replay_count: usize,
     pub inactivity_timeout_seconds: Option<u64>,
     pub topic_exclude_patterns: Vec<String>,
+    /// Maximum payload size in bytes (0 = unlimited)
+    pub max_payload_size: usize,
+    /// Maximum topic/queue name length (0 = unlimited)
+    pub max_name_length: usize,
+    /// Maximum number of topics (0 = unlimited)
+    pub max_topics: usize,
+    /// Maximum number of queues (0 = unlimited)
+    pub max_queues: usize,
+    /// Maximum queue depth (0 = unlimited)
+    pub max_queue_depth: usize,
 }
 
 impl Default for EngineConfig {
@@ -57,6 +68,11 @@ impl Default for EngineConfig {
             topic_replay_count: 0,
             inactivity_timeout_seconds: None,
             topic_exclude_patterns: Vec::new(),
+            max_payload_size: 10 * 1024 * 1024, // 10MB default
+            max_name_length: 256, // 256 chars default
+            max_topics: 0, // Unlimited by default
+            max_queues: 0, // Unlimited by default
+            max_queue_depth: 0, // Unlimited by default
         }
     }
 }
@@ -177,8 +193,39 @@ impl Engine {
         &self.config
     }
 
-    pub fn publish(&self, topic: &str, msg: Message, ttl_seconds: Option<u64>) -> usize {
+    /// Validate topic/queue name
+    pub fn validate_name(&self, name: &str) -> Result<(), String> {
+        if name.is_empty() {
+            return Err("Name cannot be empty".to_string());
+        }
+        if self.config.max_name_length > 0 && name.len() > self.config.max_name_length {
+            return Err(format!("Name too long (max {} chars)", self.config.max_name_length));
+        }
+        Ok(())
+    }
+
+    /// Validate message payload size
+    pub fn validate_payload_size(&self, payload: &str) -> Result<(), String> {
+        if self.config.max_payload_size > 0 && payload.len() > self.config.max_payload_size {
+            return Err(format!("Payload too large (max {} bytes)", self.config.max_payload_size));
+        }
+        Ok(())
+    }
+
+    pub fn publish(&self, topic: &str, msg: Message, ttl_seconds: Option<u64>) -> Result<usize, String> {
+        // Validate topic name
+        self.validate_name(topic)?;
+        
+        // Validate payload size
+        self.validate_payload_size(&msg.payload)?;
+
         let mut topics = self.topics.write();
+        
+        // Check topic limit
+        if self.config.max_topics > 0 && !topics.contains_key(topic) && topics.len() >= self.config.max_topics {
+            return Err(format!("Maximum number of topics ({}) reached", self.config.max_topics));
+        }
+        
         let is_new_topic = !topics.contains_key(topic);
         
         if let Some(entry) = topics.get_mut(topic) {
@@ -191,10 +238,26 @@ impl Engine {
                     entry.message_history.pop_front();
                 }
             }
-            entry.sender.send(msg).unwrap_or(0)
+            // Try to send, handle channel overflow gracefully
+            let result = match entry.sender.send(msg) {
+                Ok(count) => Ok(count),
+                Err(broadcast::error::SendError(_)) => {
+                    warn!("Broadcast channel full for topic '{}', message dropped", topic);
+                    Ok(0) // Return 0 subscribers if channel is full
+                }
+            };
+            // Release lock before pattern check
+            drop(topics);
+            result
         } else {
             let (tx, _rx) = broadcast::channel(self.config.broadcast_channel_capacity);
-            let count = tx.send(msg.clone()).unwrap_or(0);
+            let count = match tx.send(msg.clone()) {
+                Ok(count) => count,
+                Err(broadcast::error::SendError(_)) => {
+                    warn!("Failed to send initial message to new topic '{}'", topic);
+                    0
+                }
+            };
             let mut history = VecDeque::new();
             // Save to history if replay is enabled
             if self.config.topic_replay_count > 0 {
@@ -209,9 +272,11 @@ impl Engine {
                 },
             );
             
+            // Release lock before pattern check
+            drop(topics);
+            
             // If this is a new topic, check if it matches any active pattern subscriptions
             if is_new_topic {
-                drop(topics); // Release write lock
                 let patterns = self.pattern_subscriptions.read();
                 for (pattern, _) in patterns.iter() {
                     if matches_pattern(topic, pattern) {
@@ -221,11 +286,14 @@ impl Engine {
                 }
             }
             
-            count
+            Ok(count)
         }
     }
     
-    pub fn subscribe(&self, topic: &str, ttl_seconds: Option<u64>) -> (broadcast::Receiver<Message>, Vec<Message>) {
+    pub fn subscribe(&self, topic: &str, ttl_seconds: Option<u64>) -> Result<(broadcast::Receiver<Message>, Vec<Message>), String> {
+        // Validate topic name
+        self.validate_name(topic)?;
+
         let mut topics = self.topics.write();
         let entry = topics.entry(topic.to_string()).or_insert_with(|| {
             let (tx, _rx) = broadcast::channel(self.config.broadcast_channel_capacity);
@@ -237,20 +305,44 @@ impl Engine {
         });
         entry.meta.touch();
         let history: Vec<Message> = entry.message_history.iter().cloned().collect();
-        (entry.sender.subscribe(), history)
+        Ok((entry.sender.subscribe(), history))
     }
 
-    pub fn push_queue(&self, queue: &str, msg: Message, ttl_seconds: Option<u64>) {
+    pub fn push_queue(&self, queue: &str, msg: Message, ttl_seconds: Option<u64>) -> Result<(), String> {
+        // Validate queue name
+        self.validate_name(queue)?;
+        
+        // Validate payload size
+        self.validate_payload_size(&msg.payload)?;
+
         let mut queues = self.queues.write();
+        
+        // Check queue limit
+        if self.config.max_queues > 0 && !queues.contains_key(queue) && queues.len() >= self.config.max_queues {
+            return Err(format!("Maximum number of queues ({}) reached", self.config.max_queues));
+        }
+        
         let entry = queues.entry(queue.to_string()).or_insert_with(|| QueueEntry {
             messages: PriorityQueues::new(),
             meta: EntryMeta::new(ttl_seconds),
         });
+        
+        // Check queue depth limit
+        if self.config.max_queue_depth > 0 && entry.messages.total_len() >= self.config.max_queue_depth {
+            return Err(format!("Queue '{}' is full (max depth: {})", queue, self.config.max_queue_depth));
+        }
+        
         entry.meta.touch();
         entry.messages.push(msg);
+        Ok(())
     }
     
     pub fn pop_queue(&self, queue: &str) -> Option<Message> {
+        // Validate queue name (silently fail for invalid names)
+        if self.validate_name(queue).is_err() {
+            return None;
+        }
+
         let mut queues = self.queues.write();
         queues.get_mut(queue).and_then(|entry| {
             entry.meta.touch();
@@ -387,22 +479,49 @@ impl Engine {
     }
     
     /// Subscribe to a pattern and return receivers for all matching topics
-    pub fn subscribe_pattern(&self, pattern: &str, ttl_seconds: Option<u64>) -> Vec<(String, broadcast::Receiver<Message>, Vec<Message>)> {
+    pub fn subscribe_pattern(&self, pattern: &str, ttl_seconds: Option<u64>) -> Result<Vec<(String, broadcast::Receiver<Message>, Vec<Message>)>, String> {
+        // Validate pattern
+        if pattern.is_empty() {
+            return Err("Pattern cannot be empty".to_string());
+        }
+        if self.config.max_name_length > 0 && pattern.len() > self.config.max_name_length {
+            return Err(format!("Pattern too long (max {} chars)", self.config.max_name_length));
+        }
+
         let matching_topics = self.find_matching_topics(pattern);
         let mut subscriptions = Vec::new();
         
-        for topic in matching_topics {
-            let (rx, history) = self.subscribe(&topic, ttl_seconds);
-            subscriptions.push((topic, rx, history));
+        // Subscribe to all matching topics, skip errors for individual topics
+        for topic in &matching_topics {
+            match self.subscribe(topic, ttl_seconds) {
+                Ok((rx, history)) => {
+                    subscriptions.push((topic.clone(), rx, history));
+                }
+                Err(e) => {
+                    warn!("Failed to subscribe to topic '{}' in pattern '{}': {}", topic, pattern, e);
+                    // Continue with other topics
+                }
+            }
         }
         
-        // Track this pattern subscription
+        // Track this pattern subscription (use the same list we already computed)
         {
             let mut patterns = self.pattern_subscriptions.write();
-            patterns.insert(pattern.to_string(), self.find_matching_topics(pattern));
+            patterns.insert(pattern.to_string(), matching_topics);
+            
+            // Limit pattern subscriptions to prevent memory leaks
+            const MAX_PATTERN_SUBSCRIPTIONS: usize = 1000;
+            if patterns.len() > MAX_PATTERN_SUBSCRIPTIONS {
+                warn!("Too many pattern subscriptions ({}), removing oldest", patterns.len());
+                // Remove oldest entries (HashMap doesn't preserve order, so we remove arbitrary ones)
+                let keys_to_remove: Vec<String> = patterns.keys().take(patterns.len() - MAX_PATTERN_SUBSCRIPTIONS).cloned().collect();
+                for key in keys_to_remove {
+                    patterns.remove(&key);
+                }
+            }
         }
         
-        subscriptions
+        Ok(subscriptions)
     }
     
     /// Check if a string is a pattern (contains * or **)
@@ -457,11 +576,20 @@ impl QueueStatus {
     }
 }
 
-fn now_ms() -> u64 {
+/// Safe version of now_ms that handles clock errors gracefully
+fn now_ms_safe() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_else(|_| {
+            // If system time is before epoch, log error and return 0
+            error!("System time is before UNIX epoch, using 0 as timestamp");
+            0
+        })
+}
+
+fn now_ms() -> u64 {
+    now_ms_safe()
 }
 
 /// Check if a topic name matches a pattern
