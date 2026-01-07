@@ -4,6 +4,13 @@ Bus9 is a minimalist, ultra-lightweight "all-in-one" message broker. It combines
 
 ## 🚀 Quick Start
 
+### Using the Local Run Script (Recommended for Dev)
+We provide a helper script to build the frontend and run the backend in one go:
+
+```bash
+./run_local.sh
+```
+
 ### The Easiest Way (Docker)
 Run Bus9 with a single command:
 
@@ -13,7 +20,7 @@ docker run -p 8080:8080 denyzhirkov/bus9
 
 Open in your browser: `http://localhost:8080`
 
-### Running from Source
+### Running from Source manually
 You will need Rust and Node.js.
 
 ```bash
@@ -21,10 +28,14 @@ You will need Rust and Node.js.
 git clone https://github.com/denyzhirkov/bus9.git
 cd bus9
 
-# 2. Run (automatically builds frontend and starts server)
-# Note: For the first run, you might need to build the frontend manually or use the Dockerfile
-cd front && npm install && npm run build && cd ..
-cargo run
+# 2. Build Frontend
+cd front
+npm install
+npm run build
+cd ..
+
+# 3. Run Backend
+cargo run --release
 ```
 
 ## ✨ Key Features
@@ -33,8 +44,10 @@ cargo run
 -   **All-in-One**: Server and UI are delivered as a single executable (or Docker image).
 -   **Pub/Sub**: Broadcast messages to multiple subscribers (Live updates, chat apps).
 -   **Queues**: Task queues with delivery guarantees to a single worker (Load balancing).
+-   **TTL Support**: Messages and topics/queues can have optional Time-To-Live.
 -   **WebSocket First**: Out-of-the-box WebSocket support for browser clients.
 -   **HTTP API**: Simple REST-like API for any programming language.
+-   **Benchmarking**: Includes a benchmark suite (`run_bench.sh`).
 
 ## 📖 API Documentation
 
@@ -43,11 +56,11 @@ The server listens on port `8080` by default.
 ### 1. Send Messages (Pub/Sub)
 Sends a message to all active subscribers of a topic. Retained in memory only during delivery.
 
-**Endpoint**: `POST /api/pub?topic=<TOPIC_NAME>`
+**Endpoint**: `POST /api/pub?topic=<TOPIC_NAME>&ttl_seconds=<OPTIONAL_SECONDS>`
 **Body**: Message text or JSON.
 
 ```bash
-curl -X POST -d "Hello World" "http://localhost:8080/api/pub?topic=news"
+curl -X POST -d "Hello World" "http://localhost:8080/api/pub?topic=news&ttl_seconds=60"
 ```
 
 ### 2. Subscribe to Messages (WebSocket)
@@ -65,10 +78,10 @@ ws.onmessage = (event) => console.log('Received:', event.data);
 Unlike Pub/Sub, messages in a queue are persisted (in memory) until a worker picks them up. Each message is delivered to **exactly one** consumer.
 
 #### Push to Queue (Producer)
-**Endpoint**: `POST /api/queue/<QUEUE_NAME>`
+**Endpoint**: `POST /api/queue/<QUEUE_NAME>?ttl_seconds=<OPTIONAL_SECONDS>`
 
 ```bash
-curl -X POST -d "Process Image #123" "http://localhost:8080/api/queue/jobs"
+curl -X POST -d "Process Image #123" "http://localhost:8080/api/queue/jobs?ttl_seconds=300"
 ```
 
 #### Pop from Queue (Consumer/Worker)
@@ -87,14 +100,10 @@ curl "http://localhost:8080/api/queue/jobs"
 }
 ```
 
-### 4. Stats
-Get the current state of the broker (message counts, subscribers).
-
-**Endpoint**: `GET /api/stats`
-
-```bash
-curl "http://localhost:8080/api/stats"
-```
+### 4. Metrics & Stats
+- `GET /api/stats`: Broker snapshot (topics, queues, expired).
+- `GET /api/metrics`: Detailed metrics including request counts.
+- `WS /api/ws/stats`: Live stream of stats for the dashboard.
 
 ## 🖥️ Web Interface (Dashboard)
 
@@ -105,6 +114,15 @@ The built-in dashboard allows you to:
 -   Watch the message stream via "Live Monitor".
 
 Simply navigate to `http://localhost:8080` after starting the server.
+
+## 🧪 Benchmarking
+
+To run the built-in load test:
+
+```bash
+./run_bench.sh
+```
+This runs a Rust-based benchmark tool (`tests/bench`) to stress test the broker.
 
 ## 🛠 Technology Stack
 
