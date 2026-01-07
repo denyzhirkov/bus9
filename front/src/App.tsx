@@ -161,7 +161,7 @@ function App() {
   const totalSubscribers = subscriberEntries.reduce((sum, [, value]) => sum + value, 0)
   const totalQueueDepth = queueEntries.reduce((sum, [, value]) => sum + value, 0)
 
-  const maxRequest = Math.max(1, ...requestEntries.map(([, value]) => value))
+
   const maxSubscribers = Math.max(1, ...subscriberEntries.map(([, value]) => value))
   const maxQueueDepth = Math.max(1, ...queueEntries.map(([, value]) => value))
   const maxHistory = Math.max(1, ...requestHistory)
@@ -250,21 +250,7 @@ function App() {
           </div>
 
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: '1rem' }}>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
-              <h3 style={{ margin: 0, fontSize: '1rem' }}>Requests per Endpoint</h3>
-              {requestEntries.length === 0 && <span style={{ opacity: 0.6 }}>Waiting for requests...</span>}
-              {requestEntries.map(([name, value]) => (
-                <div key={name} style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.85em', color: 'var(--text-secondary)' }}>
-                    <span>{name}</span>
-                    <span>{value}</span>
-                  </div>
-                  <div style={{ height: 6, background: 'rgba(255,255,255,0.08)', borderRadius: 999 }}>
-                    <div style={{ height: '100%', width: `${(value / maxRequest) * 100}%`, background: 'var(--accent-color)', borderRadius: 999 }} />
-                  </div>
-                </div>
-              ))}
-            </div>
+
 
             <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
               <h3 style={{ margin: 0, fontSize: '1rem' }}>Subscribers by Topic</h3>
