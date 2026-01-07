@@ -5,6 +5,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use clap::Parser;
 use rust_embed::RustEmbed;
 use std::{net::SocketAddr, sync::Arc};
 use tokio::net::TcpListener;
@@ -13,7 +14,35 @@ use std::collections::HashMap;
 use parking_lot::RwLock;
 
 mod engine;
-use engine::{Engine, ExpiredEntry, Message, QueueStatus, TopicStatus};
+use engine::{Engine, EngineConfig, ExpiredEntry, Message, QueueStatus, TopicStatus};
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct AppArgs {
+    /// Port to listen on
+    #[arg(long, env = "BUS9_PORT", default_value_t = 8080)]
+    port: u16,
+
+    /// Host to bind to
+    #[arg(long, env = "BUS9_HOST", default_value = "0.0.0.0")]
+    host: String,
+
+    /// Initial capacity for broadcast channels
+    #[arg(long, env = "BUS9_TOPIC_CAPACITY", default_value_t = 1024)]
+    topic_capacity: usize,
+
+    /// Maximum number of expired events to keep in history
+    #[arg(long, env = "BUS9_MAX_EXPIRED", default_value_t = 50)]
+    max_expired: usize,
+
+    /// Cleanup interval in milliseconds
+    #[arg(long, env = "BUS9_SWEEP_INTERVAL_MS", default_value_t = 1000)]
+    sweep_interval_ms: u64,
+
+    /// Stats update interval in milliseconds
+    #[arg(long, env = "BUS9_STATS_INTERVAL_MS", default_value_t = 500)]
+    stats_interval_ms: u64,
+}
 
 #[derive(RustEmbed)]
 #[folder = "front/dist"]
@@ -22,10 +51,15 @@ struct Assets;
 struct AppState {
     engine: Arc<Engine>,
     metrics: MetricsStore,
+    config: AppConfig,
 }
 
 struct MetricsStore {
     requests: RwLock<HashMap<String, u64>>,
+}
+
+struct AppConfig {
+    stats_interval_ms: u64,
 }
 
 impl MetricsStore {
@@ -68,18 +102,32 @@ struct QueueMetrics {
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
+    let args = AppArgs::parse();
 
-    let engine = Arc::new(Engine::new());
+    let engine_config = EngineConfig {
+        broadcast_channel_capacity: args.topic_capacity,
+        max_expired_events: args.max_expired,
+    };
+
+    let engine = Arc::new(Engine::new(engine_config));
     let sweep_engine = Arc::clone(&engine);
+    let sweep_interval_ms = args.sweep_interval_ms;
+
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(sweep_interval_ms));
         loop {
             interval.tick().await;
             sweep_engine.sweep_expired();
         }
     });
     let metrics = MetricsStore::new();
-    let state = Arc::new(AppState { engine, metrics });
+    let state = Arc::new(AppState {
+        engine,
+        metrics,
+        config: AppConfig {
+            stats_interval_ms: args.stats_interval_ms,
+        },
+    });
 
     let app = Router::new()
         .route("/health", get(health_handler))
@@ -92,7 +140,9 @@ async fn main() {
         .fallback(static_handler)
         .with_state(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
+    let addr: SocketAddr = format!("{}:{}", args.host, args.port)
+        .parse()
+        .expect("Invalid address format");
     println!("Listening on http://{}", addr);
     
     let listener = match TcpListener::bind(addr).await {
@@ -280,7 +330,7 @@ async fn stats_ws_handler(
 }
 
 async fn handle_stats_socket(mut socket: WebSocket, state: Arc<AppState>) {
-    let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(state.config.stats_interval_ms));
     loop {
         interval.tick().await;
         let stats = state.engine.get_stats();

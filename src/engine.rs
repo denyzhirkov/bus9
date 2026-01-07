@@ -21,7 +21,23 @@ impl Message {
     }
 }
 
+#[derive(Clone, Debug, Copy)]
+pub struct EngineConfig {
+    pub broadcast_channel_capacity: usize,
+    pub max_expired_events: usize,
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            broadcast_channel_capacity: 1024,
+            max_expired_events: 50,
+        }
+    }
+}
+
 pub struct Engine {
+    pub config: EngineConfig,
     // Pub/Sub: simple broadcast
     pub topics: RwLock<HashMap<String, TopicEntry>>,
     // Queue: Point-to-Point
@@ -77,8 +93,9 @@ pub struct BrokerSnapshot {
 }
 
 impl Engine {
-    pub fn new() -> Self {
+    pub fn new(config: EngineConfig) -> Self {
         Self {
+            config,
             topics: RwLock::new(HashMap::new()),
             queues: RwLock::new(HashMap::new()),
             expired_events: RwLock::new(Vec::new()),
@@ -91,7 +108,7 @@ impl Engine {
             entry.meta.touch();
             entry.sender.send(msg).unwrap_or(0)
         } else {
-            let (tx, _rx) = broadcast::channel(1024);
+            let (tx, _rx) = broadcast::channel(self.config.broadcast_channel_capacity);
             let count = tx.send(msg).unwrap_or(0);
             topics.insert(
                 topic.to_string(),
@@ -107,7 +124,7 @@ impl Engine {
     pub fn subscribe(&self, topic: &str, ttl_seconds: Option<u64>) -> broadcast::Receiver<Message> {
         let mut topics = self.topics.write();
         let entry = topics.entry(topic.to_string()).or_insert_with(|| {
-            let (tx, _rx) = broadcast::channel(1024);
+            let (tx, _rx) = broadcast::channel(self.config.broadcast_channel_capacity);
             TopicEntry {
                 sender: tx,
                 meta: EntryMeta::new(ttl_seconds),
@@ -199,8 +216,8 @@ impl Engine {
         if !expired_entries.is_empty() {
             let mut expired = self.expired_events.write();
             expired.extend(expired_entries);
-            if expired.len() > 50 {
-                let drain_count = expired.len() - 50;
+            if expired.len() > self.config.max_expired_events {
+                let drain_count = expired.len() - self.config.max_expired_events;
                 expired.drain(0..drain_count);
             }
         }

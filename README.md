@@ -18,6 +18,11 @@ Run Bus9 with a single command:
 docker run -p 8080:8080 denyzhirkov/bus9
 ```
 
+Run with custom port:
+```bash
+docker run -p 9090:9090 -e BUS9_PORT=9090 denyzhirkov/bus9
+```
+
 Open in your browser: `http://localhost:8080`
 
 ### Running from Source manually
@@ -37,6 +42,18 @@ cd ..
 # 3. Run Backend
 cargo run --release
 ```
+
+## ⚙️ Configuration
+Bus9 is zero-config by default, but can be configured via command-line arguments or environment variables.
+
+| Argument | Env Variable | Default | Description |
+|----------|--------------|---------|-------------|
+| `--port` | `BUS9_PORT` | `8080` | Port to listen on |
+| `--host` | `BUS9_HOST` | `0.0.0.0` | Host to bind to |
+| `--topic-capacity` | `BUS9_TOPIC_CAPACITY` | `1024` | Broadcast channel capacity |
+| `--max-expired` | `BUS9_MAX_EXPIRED` | `50` | Max expired events to keep |
+| `--sweep-interval-ms` | `BUS9_SWEEP_INTERVAL_MS` | `1000` | Expirations cleanup interval (ms) |
+| `--stats-interval-ms` | `BUS9_STATS_INTERVAL_MS` | `500` | Stats WebSocket update interval (ms) |
 
 ## ✨ Key Features
 
