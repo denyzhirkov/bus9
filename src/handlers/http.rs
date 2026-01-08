@@ -61,6 +61,17 @@ pub async fn health_handler(State(state): State<Arc<AppState>>) -> &'static str 
     "OK"
 }
 
+#[derive(Serialize)]
+pub struct VersionResponse {
+    pub version: String,
+}
+
+pub async fn version_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(VersionResponse {
+        version: state.version.clone(),
+    })
+}
+
 pub async fn publish_handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<PublishParams>,

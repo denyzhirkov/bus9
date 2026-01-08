@@ -17,6 +17,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::error;
+use utils::read_version;
 
 #[tokio::main]
 async fn main() {
@@ -50,11 +51,13 @@ async fn main() {
     });
 
     let metrics = MetricsStore::new();
+    let version = read_version();
     let state = Arc::new(AppState {
         engine,
         metrics,
         config: AppConfig::new(args.stats_interval_ms),
         auth_token: args.auth_token,
+        version: version.clone(),
     });
 
     let app = create_router(state);
@@ -78,7 +81,7 @@ async fn main() {
         }
     };
 
-    println!("Bus9 server started successfully");
+    println!("Bus9 server v{} started successfully", version);
 
     if let Err(e) = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

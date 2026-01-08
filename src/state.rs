@@ -9,6 +9,7 @@ pub struct AppState {
     pub metrics: MetricsStore,
     pub config: AppConfig,
     pub auth_token: Option<String>,
+    pub version: String,
 }
 
 pub struct MetricsStore {

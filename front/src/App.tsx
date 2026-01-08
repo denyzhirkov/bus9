@@ -59,6 +59,7 @@ function App() {
     queues: { active: 0, entries: {} },
     expired: [],
   })
+  const [version, setVersion] = useState<string>('')
   const [msgInput, setMsgInput] = useState('')
   const [target, setTarget] = useState('')
   const [mode, setMode] = useState<'pub' | 'queue'>('pub')
@@ -80,6 +81,22 @@ function App() {
     }
 
     return () => ws.close()
+  }, [])
+
+  useEffect(() => {
+    const fetchVersion = async () => {
+      try {
+        const response = await fetch('/api/version')
+        if (response.ok) {
+          const data = await response.json()
+          setVersion(data.version)
+        }
+      } catch (error) {
+        console.error('Failed to fetch version:', error)
+      }
+    }
+
+    fetchVersion()
   }, [])
 
   useEffect(() => {
@@ -193,7 +210,12 @@ function App() {
           <img src="/logo.png" alt="Bus9" />
         </div>
         <div>
-          <h1>Bus9</h1>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+            <h1>Bus9</h1>
+            {version && (
+              <span className="version-badge">v{version}</span>
+            )}
+          </div>
           <span className="subtitle">Message Broker</span>
         </div>
       </header>

@@ -10,6 +10,7 @@ use crate::state::AppState;
 pub fn create_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(http::health_handler))
+        .route("/api/version", get(http::version_handler))
         .route("/api/pub", post(http::publish_handler))
         .route("/api/sub", get(websocket::subscribe_handler))
         .route("/api/stream", get(sse::stream_handler))

@@ -83,6 +83,16 @@ body {
   font-size: 0.9rem;
 }
 
+.version-badge {
+  background: var(--border-color);
+  color: var(--text-secondary);
+  padding: 0.25rem 0.5rem;
+  border-radius: 4px;
+  font-size: 0.75rem;
+  font-weight: 500;
+  font-family: monospace;
+}
+
 /* Overview Grid */
 .overview-grid {
   display: grid;
