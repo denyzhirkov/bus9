@@ -183,43 +183,44 @@ docker run -d \
 
 ### 1. Pub/Sub (Publish/Subscribe)
 - **Broadcast сообщений** — одно сообщение доставляется всем подписчикам
-- **WebSocket поддержка** — нативная поддержка для браузеров
+- **WebSocket поддержка** — нативная поддержка для браузеров (двусторонняя связь)
+- **Server-Sent Events (SSE)** — HTTP-потоковая передача для одностороннего потока данных
 - **HTTP API** — простой REST API для любого языка программирования
 - **Использование**: Live обновления, чаты, уведомления, мониторинг
 
-### 2. Queues (Очереди задач)
+### 3. Queues (Очереди задач)
 - **Point-to-Point** — каждое сообщение доставляется только одному потребителю
 - **Персистентность** — сообщения хранятся в памяти до обработки
 - **Приоритеты** — поддержка high/normal/low приоритетов
 - **Использование**: Распределение задач, load balancing, фоновые задачи
 
-### 3. TTL (Time-To-Live)
+### 4. TTL (Time-To-Live)
 - **TTL для топиков/очередей** — автоматическое удаление после периода неактивности
 - **TTL для сообщений** — опциональный срок жизни сообщений
 - **Гибкая настройка** — можно комбинировать с auto-cleanup
 
-### 4. Message Replay
+### 5. Message Replay
 - **История сообщений** — новые подписчики получают последние N сообщений
 - **Настраиваемый размер** — количество сообщений для replay
 - **Использование**: Восстановление после переподключения, инициализация контекста
 
-### 5. Pattern-based Subscription
+### 6. Pattern-based Subscription
 - **Wildcard паттерны** — подписка на несколько топиков одновременно
 - **Синтаксис**: `*` (один сегмент), `**` (любой путь)
 - **Автоматическое подключение** — новые топики автоматически добавляются к подписке
 - **Исключения** — возможность исключить определенные топики из паттернов
 
-### 6. Queue Priority
+### 7. Queue Priority
 - **Три уровня приоритета**: high, normal, low
 - **Приоритетная обработка** — high всегда обрабатывается первым
 - **Обратная совместимость** — без указания приоритета = normal
 
-### 7. Auto-cleanup
+### 8. Auto-cleanup
 - **Автоматическая очистка** — удаление неактивных топиков/очередей
 - **Настраиваемый таймаут** — период неактивности для удаления
 - **Независимость от TTL** — работает параллельно с TTL механизмом
 
-### 8. Authentication
+### 9. Authentication
 - **Простая авторизация** — токен через query параметр
 - **Опциональная** — работает без авторизации по умолчанию
 - **Защита API** — все операции требуют токен (если задан)
@@ -448,7 +449,156 @@ func main() {
 
 ---
 
-### 3. Pattern-based Subscription (Wildcard подписки)
+### 3. Подписка на сообщения (Server-Sent Events / SSE)
+
+Альтернатива WebSocket для одностороннего потока данных (сервер → клиент). SSE проще в использовании и лучше работает за прокси и балансировщиками нагрузки.
+
+**Endpoint:** `GET /api/stream?topic=<TOPIC_NAME>&ttl_seconds=<OPTIONAL_SECONDS>`
+
+**Параметры:**
+- `topic` (обязательный) — имя топика или паттерн
+- `ttl_seconds` (опциональный) — TTL для подписки
+- `token` (опциональный) — токен авторизации
+
+**Преимущества SSE:**
+- Проще чем WebSocket (обычный HTTP GET запрос)
+- Автоматическое переподключение браузером
+- Лучшая совместимость с прокси и балансировщиками
+- Меньше overhead для односторонней передачи данных
+
+**Примеры:**
+
+#### JavaScript (браузер)
+```javascript
+// Простая SSE подписка
+const eventSource = new EventSource('http://localhost:8080/api/stream?topic=news');
+
+eventSource.onmessage = (event) => {
+  const msg = JSON.parse(event.data);
+  console.log('Received:', msg.payload);
+};
+
+eventSource.onerror = (error) => {
+  console.error('SSE Error:', error);
+  // Браузер автоматически переподключится
+};
+```
+
+#### JavaScript (с авторизацией)
+```javascript
+const token = 'my-secret-token';
+const eventSource = new EventSource(
+  `http://localhost:8080/api/stream?topic=news&token=${token}`
+);
+
+eventSource.onmessage = (event) => {
+  const msg = JSON.parse(event.data);
+  console.log('Message:', msg);
+};
+```
+
+#### curl (командная строка)
+```bash
+# Поток сообщений из топика
+curl -N "http://localhost:8080/api/stream?topic=news"
+
+# С авторизацией
+curl -N "http://localhost:8080/api/stream?topic=news&token=my-secret-token"
+
+# Подписка по паттерну
+curl -N "http://localhost:8080/api/stream?topic=sensor.*"
+```
+
+#### Python
+```python
+import requests
+import json
+
+def subscribe_sse(topic, token=None):
+    url = f"http://localhost:8080/api/stream"
+    params = {"topic": topic}
+    if token:
+        params["token"] = token
+    
+    response = requests.get(url, params=params, stream=True)
+    
+    for line in response.iter_lines():
+        if line:
+            # SSE формат: "data: <json>\n\n"
+            if line.startswith(b'data: '):
+                data = line[6:].decode('utf-8')
+                msg = json.loads(data)
+                print(f"Received: {msg['payload']}")
+
+# Использование
+subscribe_sse("news", token="my-secret-token")
+```
+
+#### Node.js
+```javascript
+const EventSource = require('eventsource');
+
+const eventSource = new EventSource(
+  'http://localhost:8080/api/stream?topic=news&token=my-secret-token'
+);
+
+eventSource.onmessage = (event) => {
+  const msg = JSON.parse(event.data);
+  console.log('Received:', msg);
+};
+
+eventSource.onerror = (error) => {
+  console.error('SSE Error:', error);
+};
+```
+
+#### Go
+```go
+package main
+
+import (
+    "bufio"
+    "encoding/json"
+    "fmt"
+    "net/http"
+    "strings"
+)
+
+func subscribeSSE(topic string, token string) {
+    url := fmt.Sprintf("http://localhost:8080/api/stream?topic=%s&token=%s", topic, token)
+    resp, err := http.Get(url)
+    if err != nil {
+        panic(err)
+    }
+    defer resp.Body.Close()
+
+    scanner := bufio.NewScanner(resp.Body)
+    for scanner.Scan() {
+        line := scanner.Text()
+        if strings.HasPrefix(line, "data: ") {
+            data := line[6:]
+            var msg map[string]interface{}
+            json.Unmarshal([]byte(data), &msg)
+            fmt.Printf("Received: %v\n", msg)
+        }
+    }
+}
+```
+
+**Когда использовать SSE vs WebSocket:**
+- **Используйте SSE** когда нужен только поток сервер → клиент (односторонний)
+- **Используйте WebSocket** когда нужна двусторонняя связь
+- **Используйте SSE** когда нужна лучшая совместимость с прокси/балансировщиками
+- **Используйте WebSocket** когда нужна минимальная задержка и полнодуплексная связь
+
+**Примечание:** SSE поддерживает те же функции, что и WebSocket подписки:
+- Подписки по паттернам (wildcard)
+- Message replay (если включено)
+- Авторизация через токен
+
+---
+
+### 4. Pattern-based Subscription (Wildcard подписки)
 
 Подписка на несколько топиков одновременно используя паттерны.
 
@@ -491,7 +641,7 @@ const ws = new WebSocket('ws://localhost:8080/api/sub?topic=logs.**');
 
 ---
 
-### 4. Очереди задач (Queues)
+### 5. Очереди задач (Queues)
 
 В отличие от Pub/Sub, сообщения в очередях персистентны (хранятся в памяти) до обработки. Каждое сообщение доставляется **ровно одному** потребителю.
 

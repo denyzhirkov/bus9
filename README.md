@@ -183,7 +183,8 @@ docker run -d \
 
 ### 1. Pub/Sub (Publish/Subscribe)
 - **Message Broadcasting** — one message delivered to all subscribers
-- **WebSocket Support** — native support for browsers
+- **WebSocket Support** — native support for browsers (bidirectional)
+- **Server-Sent Events (SSE)** — HTTP-based streaming for one-way data flow
 - **HTTP API** — simple REST API for any programming language
 - **Use Cases**: Live updates, chat applications, notifications, monitoring
 
@@ -203,23 +204,23 @@ docker run -d \
 - **Configurable Size** — number of messages for replay
 - **Use Cases**: Reconnection recovery, context initialization
 
-### 5. Pattern-based Subscription
+### 6. Pattern-based Subscription
 - **Wildcard Patterns** — subscribe to multiple topics simultaneously
 - **Syntax**: `*` (single segment), `**` (any path)
 - **Auto-connection** — new topics automatically added to subscription
 - **Exclusions** — ability to exclude specific topics from patterns
 
-### 6. Queue Priority
+### 7. Queue Priority
 - **Three Priority Levels**: high, normal, low
 - **Priority Processing** — high always processed first
 - **Backward Compatible** — no priority specified = normal
 
-### 7. Auto-cleanup
+### 8. Auto-cleanup
 - **Automatic Cleanup** — removes inactive topics/queues
 - **Configurable Timeout** — inactivity period for removal
 - **Independent of TTL** — works in parallel with TTL mechanism
 
-### 8. Authentication
+### 9. Authentication
 - **Simple Authentication** — token via query parameter
 - **Optional** — works without authentication by default
 - **API Protection** — all operations require token (if set)
@@ -448,7 +449,156 @@ func main() {
 
 ---
 
-### 3. Pattern-based Subscription (Wildcard Subscriptions)
+### 3. Subscribe to Messages (Server-Sent Events / SSE)
+
+Alternative to WebSocket for one-way streaming (server → client). SSE is simpler to use and works better behind proxies and load balancers.
+
+**Endpoint:** `GET /api/stream?topic=<TOPIC_NAME>&ttl_seconds=<OPTIONAL_SECONDS>`
+
+**Parameters:**
+- `topic` (required) — topic name or pattern
+- `ttl_seconds` (optional) — TTL for subscription
+- `token` (optional) — authentication token
+
+**Advantages of SSE:**
+- Simpler than WebSocket (standard HTTP GET request)
+- Automatic reconnection by browsers
+- Better compatibility with proxies and load balancers
+- Lower overhead for one-way data streaming
+
+**Examples:**
+
+#### JavaScript (Browser)
+```javascript
+// Simple SSE subscription
+const eventSource = new EventSource('http://localhost:8080/api/stream?topic=news');
+
+eventSource.onmessage = (event) => {
+  const msg = JSON.parse(event.data);
+  console.log('Received:', msg.payload);
+};
+
+eventSource.onerror = (error) => {
+  console.error('SSE Error:', error);
+  // Browser will automatically reconnect
+};
+```
+
+#### JavaScript (with Authentication)
+```javascript
+const token = 'my-secret-token';
+const eventSource = new EventSource(
+  `http://localhost:8080/api/stream?topic=news&token=${token}`
+);
+
+eventSource.onmessage = (event) => {
+  const msg = JSON.parse(event.data);
+  console.log('Message:', msg);
+};
+```
+
+#### curl (Command Line)
+```bash
+# Stream messages from a topic
+curl -N "http://localhost:8080/api/stream?topic=news"
+
+# With authentication
+curl -N "http://localhost:8080/api/stream?topic=news&token=my-secret-token"
+
+# Pattern-based subscription
+curl -N "http://localhost:8080/api/stream?topic=sensor.*"
+```
+
+#### Python
+```python
+import requests
+import json
+
+def subscribe_sse(topic, token=None):
+    url = f"http://localhost:8080/api/stream"
+    params = {"topic": topic}
+    if token:
+        params["token"] = token
+    
+    response = requests.get(url, params=params, stream=True)
+    
+    for line in response.iter_lines():
+        if line:
+            # SSE format: "data: <json>\n\n"
+            if line.startswith(b'data: '):
+                data = line[6:].decode('utf-8')
+                msg = json.loads(data)
+                print(f"Received: {msg['payload']}")
+
+# Usage
+subscribe_sse("news", token="my-secret-token")
+```
+
+#### Node.js
+```javascript
+const EventSource = require('eventsource');
+
+const eventSource = new EventSource(
+  'http://localhost:8080/api/stream?topic=news&token=my-secret-token'
+);
+
+eventSource.onmessage = (event) => {
+  const msg = JSON.parse(event.data);
+  console.log('Received:', msg);
+};
+
+eventSource.onerror = (error) => {
+  console.error('SSE Error:', error);
+};
+```
+
+#### Go
+```go
+package main
+
+import (
+    "bufio"
+    "encoding/json"
+    "fmt"
+    "net/http"
+    "strings"
+)
+
+func subscribeSSE(topic string, token string) {
+    url := fmt.Sprintf("http://localhost:8080/api/stream?topic=%s&token=%s", topic, token)
+    resp, err := http.Get(url)
+    if err != nil {
+        panic(err)
+    }
+    defer resp.Body.Close()
+
+    scanner := bufio.NewScanner(resp.Body)
+    for scanner.Scan() {
+        line := scanner.Text()
+        if strings.HasPrefix(line, "data: ") {
+            data := line[6:]
+            var msg map[string]interface{}
+            json.Unmarshal([]byte(data), &msg)
+            fmt.Printf("Received: %v\n", msg)
+        }
+    }
+}
+```
+
+**When to Use SSE vs WebSocket:**
+- **Use SSE** when you only need server → client streaming (one-way)
+- **Use WebSocket** when you need bidirectional communication
+- **Use SSE** when you need better proxy/load balancer compatibility
+- **Use WebSocket** when you need lower latency and full-duplex communication
+
+**Note:** SSE supports the same features as WebSocket subscriptions:
+- Pattern-based subscriptions (wildcards)
+- Message replay (if enabled)
+- Authentication via token
+
+---
+
+### 4. Pattern-based Subscription (Wildcard Subscriptions)
 
 Subscribe to multiple topics simultaneously using patterns.
 
@@ -491,7 +641,7 @@ You can exclude specific topics from wildcard subscriptions:
 
 ---
 
-### 4. Task Queues
+### 5. Task Queues
 
 Unlike Pub/Sub, messages in queues are persistent (stored in memory) until processed. Each message is delivered to **exactly one** consumer.
 
