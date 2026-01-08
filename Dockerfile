@@ -16,8 +16,9 @@ RUN mkdir src && echo "fn main() {}" > src/main.rs
 RUN cargo build --release
 RUN rm -rf src
 
-# Copy actual source and frontend assets
+# Copy actual source, version.json and frontend assets
 COPY src/ src/
+COPY version.json version.json
 # Note: implementation of embedding will happen later, but we prepare the stage
 COPY --from=front-builder /app/front/dist front/dist
 
@@ -30,6 +31,7 @@ RUN cargo build --release
 FROM alpine:3.20
 WORKDIR /app
 COPY --from=backend-builder /app/target/release/bus9 /app/bus9
+COPY --from=backend-builder /app/version.json /app/version.json
 # Expose default port (to be implemented)
 EXPOSE 8080
 CMD ["./bus9"]
