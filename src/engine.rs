@@ -187,11 +187,6 @@ impl Engine {
             pattern_subscriptions: RwLock::new(HashMap::new()),
         }
     }
-    
-    /// Get a reference to the engine config
-    pub fn config(&self) -> &EngineConfig {
-        &self.config
-    }
 
     /// Validate topic/queue name
     pub fn validate_name(&self, name: &str) -> Result<(), String> {
@@ -522,11 +517,6 @@ impl Engine {
         }
         
         Ok(subscriptions)
-    }
-    
-    /// Check if a string is a pattern (contains * or **)
-    pub fn is_pattern(&self, s: &str) -> bool {
-        s.contains('*')
     }
 }
 

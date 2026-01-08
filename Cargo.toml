@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-axum = { version = "0.7", features = ["ws", "sse"] }
+axum = { version = "0.7", features = ["ws"] }
 mime_guess = "2.0.5"
 parking_lot = "0.12.5"
 rust-embed = "8.9.0"
