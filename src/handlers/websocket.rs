@@ -3,6 +3,7 @@ use axum::{
     response::IntoResponse,
 };
 use std::sync::Arc;
+use tokio::sync::broadcast::error::RecvError;
 use tracing::warn;
 
 use crate::auth::check_auth;
@@ -84,15 +85,26 @@ async fn handle_socket(
         let (tx, mut rx) = mpsc::unbounded_channel();
         
         // Spawn tasks to forward messages from each subscription
-        // Use a bounded channel or limit the number of tasks to prevent resource exhaustion
+        let disconnect_on_lag = state.config.backpressure == "disconnect";
         let mut task_handles = Vec::new();
         for (topic_name, mut receiver, _) in subscriptions {
             let tx_clone = tx.clone();
             let handle = tokio::spawn(async move {
-                while let Ok(msg) = receiver.recv().await {
-                    if tx_clone.send((topic_name.clone(), msg)).is_err() {
-                        // Receiver dropped, exit
-                        break;
+                loop {
+                    match receiver.recv().await {
+                        Ok(msg) => {
+                            if tx_clone.send((topic_name.clone(), msg)).is_err() {
+                                break;
+                            }
+                        }
+                        Err(RecvError::Lagged(n)) => {
+                            warn!("Pattern subscriber lagged on '{}', skipped {} messages", topic_name, n);
+                            if disconnect_on_lag {
+                                break;
+                            }
+                            // "drop" strategy: continue receiving
+                        }
+                        Err(RecvError::Closed) => break,
                     }
                 }
             });
@@ -133,9 +145,30 @@ async fn handle_socket(
         }
         
         // Then send live messages
-        while let Ok(msg) = rx.recv().await {
-            if send_message(&mut socket, &msg).await.is_err() {
-                break;
+        let disconnect_on_lag = state.config.backpressure == "disconnect";
+        loop {
+            match rx.recv().await {
+                Ok(msg) => {
+                    if send_message(&mut socket, &msg).await.is_err() {
+                        break;
+                    }
+                }
+                Err(RecvError::Lagged(n)) => {
+                    warn!("WebSocket subscriber lagged on topic '{}', skipped {} messages", topic, n);
+                    if disconnect_on_lag {
+                        let _ = socket.send(axum::extract::ws::Message::Text(
+                            format!(r#"{{"warning":"lagged","skipped":{}}}"#, n).into()
+                        )).await;
+                        break;
+                    }
+                    // "drop" strategy: notify client and continue
+                    if socket.send(axum::extract::ws::Message::Text(
+                        format!(r#"{{"warning":"lagged","skipped":{}}}"#, n).into()
+                    )).await.is_err() {
+                        break;
+                    }
+                }
+                Err(RecvError::Closed) => break,
             }
         }
     }

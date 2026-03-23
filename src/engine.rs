@@ -58,6 +58,12 @@ pub struct EngineConfig {
     pub max_queues: usize,
     /// Maximum queue depth (0 = unlimited)
     pub max_queue_depth: usize,
+    /// ACK timeout in milliseconds (0 = ACK disabled)
+    pub ack_timeout_ms: u64,
+    /// Max delivery attempts before DLQ (0 = no DLQ)
+    pub max_retries: u32,
+    /// Suffix for DLQ names
+    pub dlq_suffix: String,
 }
 
 impl Default for EngineConfig {
@@ -73,6 +79,9 @@ impl Default for EngineConfig {
             max_topics: 0, // Unlimited by default
             max_queues: 0, // Unlimited by default
             max_queue_depth: 0, // Unlimited by default
+            ack_timeout_ms: 0, // ACK disabled by default
+            max_retries: 0, // No DLQ by default
+            dlq_suffix: ".dlq".to_string(),
         }
     }
 }
@@ -86,6 +95,10 @@ pub struct Engine {
     expired_events: RwLock<Vec<ExpiredEntry>>,
     // Pattern subscriptions: pattern -> list of matching topics
     pattern_subscriptions: RwLock<HashMap<String, Vec<String>>>,
+    // Pending ACK: message_id -> PendingMessage
+    pending_acks: RwLock<HashMap<String, PendingMessage>>,
+    // Retry counter: message_id -> retry count (persists across pop/timeout cycles)
+    retry_counts: RwLock<HashMap<String, u32>>,
 }
 
 #[derive(Clone)]
@@ -170,6 +183,15 @@ pub struct ExpiredEntry {
     pub reason: String,
 }
 
+/// A message awaiting ACK confirmation
+#[derive(Clone, Debug)]
+pub struct PendingMessage {
+    pub message: Message,
+    pub queue: String,
+    pub popped_at: u64,
+    pub retry_count: u32,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct BrokerSnapshot {
     pub topics: HashMap<String, TopicStatus>,
@@ -185,6 +207,8 @@ impl Engine {
             queues: RwLock::new(HashMap::new()),
             expired_events: RwLock::new(Vec::new()),
             pattern_subscriptions: RwLock::new(HashMap::new()),
+            pending_acks: RwLock::new(HashMap::new()),
+            retry_counts: RwLock::new(HashMap::new()),
         }
     }
 
@@ -339,10 +363,71 @@ impl Engine {
         }
 
         let mut queues = self.queues.write();
-        queues.get_mut(queue).and_then(|entry| {
+        let msg = queues.get_mut(queue).and_then(|entry| {
             entry.meta.touch();
             entry.messages.pop()
-        })
+        });
+
+        // If ACK is enabled, move message to pending
+        if let Some(ref m) = msg {
+            if self.config.ack_timeout_ms > 0 {
+                let retry_count = self.retry_counts.read().get(&m.id).copied().unwrap_or(0);
+                let mut pending = self.pending_acks.write();
+                pending.insert(m.id.clone(), PendingMessage {
+                    message: m.clone(),
+                    queue: queue.to_string(),
+                    popped_at: now_ms(),
+                    retry_count,
+                });
+            }
+        }
+
+        msg
+    }
+
+    /// Acknowledge a message from a queue (removes from pending)
+    pub fn ack_queue(&self, queue: &str, message_id: &str) -> Result<(), String> {
+        if self.config.ack_timeout_ms == 0 {
+            return Err("ACK is disabled (ack-timeout=0)".to_string());
+        }
+
+        let mut pending = self.pending_acks.write();
+        match pending.remove(message_id) {
+            Some(p) if p.queue == queue => {
+                self.retry_counts.write().remove(message_id);
+                Ok(())
+            }
+            Some(p) => {
+                // Wrong queue — put it back
+                pending.insert(message_id.to_string(), p);
+                Err(format!("Message '{}' does not belong to queue '{}'", message_id, queue))
+            }
+            None => Err(format!("Message '{}' not found in pending", message_id)),
+        }
+    }
+
+    /// Reject a message — immediately return it to the queue
+    pub fn nack_queue(&self, queue: &str, message_id: &str) -> Result<(), String> {
+        if self.config.ack_timeout_ms == 0 {
+            return Err("ACK is disabled (ack-timeout=0)".to_string());
+        }
+
+        let mut pending = self.pending_acks.write();
+        match pending.remove(message_id) {
+            Some(p) if p.queue == queue => {
+                drop(pending);
+                let mut queues = self.queues.write();
+                if let Some(entry) = queues.get_mut(queue) {
+                    entry.messages.push(p.message);
+                }
+                Ok(())
+            }
+            Some(p) => {
+                pending.insert(message_id.to_string(), p);
+                Err(format!("Message '{}' does not belong to queue '{}'", message_id, queue))
+            }
+            None => Err(format!("Message '{}' not found in pending", message_id)),
+        }
     }
 
     pub fn get_stats(&self) -> BrokerSnapshot {
@@ -440,6 +525,46 @@ impl Engine {
             if expired.len() > self.config.max_expired_events {
                 let drain_count = expired.len() - self.config.max_expired_events;
                 expired.drain(0..drain_count);
+            }
+        }
+
+        // Sweep expired pending ACKs — return messages to their queues or DLQ
+        if self.config.ack_timeout_ms > 0 {
+            let mut pending = self.pending_acks.write();
+            let timed_out: Vec<(String, PendingMessage)> = pending
+                .iter()
+                .filter(|(_, p)| now.saturating_sub(p.popped_at) >= self.config.ack_timeout_ms)
+                .map(|(id, p)| (id.clone(), p.clone()))
+                .collect();
+
+            if !timed_out.is_empty() {
+                let mut queues = self.queues.write();
+                let mut retries = self.retry_counts.write();
+                for (id, p) in timed_out {
+                    pending.remove(&id);
+                    let new_count = p.retry_count + 1;
+
+                    // Check if max retries exceeded → move to DLQ
+                    if self.config.max_retries > 0 && new_count >= self.config.max_retries {
+                        let dlq_name = format!("{}{}", p.queue, self.config.dlq_suffix);
+                        warn!("Message '{}' exceeded max retries ({}) on queue '{}', moving to DLQ '{}'",
+                            id, self.config.max_retries, p.queue, dlq_name);
+                        let dlq_entry = queues.entry(dlq_name).or_insert_with(|| QueueEntry {
+                            messages: PriorityQueues::new(),
+                            meta: EntryMeta::new(None),
+                        });
+                        dlq_entry.messages.push(p.message);
+                        retries.remove(&id);
+                    } else {
+                        warn!("ACK timeout for message '{}' on queue '{}' (retry {}/{}), returning to queue",
+                            id, p.queue, new_count,
+                            if self.config.max_retries > 0 { self.config.max_retries.to_string() } else { "∞".to_string() });
+                        if let Some(entry) = queues.get_mut(&p.queue) {
+                            entry.messages.push(p.message);
+                        }
+                        retries.insert(id, new_count);
+                    }
+                }
             }
         }
     }

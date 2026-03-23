@@ -7,6 +7,7 @@ use std::convert::Infallible;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use tokio::sync::broadcast::error::RecvError;
 use tracing::warn;
 
 use crate::auth::check_auth;
@@ -80,13 +81,25 @@ fn create_sse_stream(
         let (tx, rx) = mpsc::unbounded_channel();
         
         // Spawn tasks to forward messages
+        let disconnect_on_lag = state.config.backpressure == "disconnect";
         let mut task_handles = Vec::new();
         for (topic_name, mut receiver, _) in subscriptions {
             let tx_clone = tx.clone();
             let handle = tokio::spawn(async move {
-                while let Ok(msg) = receiver.recv().await {
-                    if tx_clone.send((topic_name.clone(), msg)).is_err() {
-                        break;
+                loop {
+                    match receiver.recv().await {
+                        Ok(msg) => {
+                            if tx_clone.send((topic_name.clone(), msg)).is_err() {
+                                break;
+                            }
+                        }
+                        Err(RecvError::Lagged(n)) => {
+                            warn!("SSE pattern subscriber lagged on '{}', skipped {} messages", topic_name, n);
+                            if disconnect_on_lag {
+                                break;
+                            }
+                        }
+                        Err(RecvError::Closed) => break,
                     }
                 }
             });
@@ -159,18 +172,40 @@ fn create_sse_stream(
         let history_stream = stream::iter(history_events.into_iter().map(Ok));
         
         // Then live messages - convert broadcast receiver to stream via channel
+        let disconnect_on_lag = state.config.backpressure == "disconnect";
+        let topic_name = topic.clone();
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(async move {
-            while let Ok(msg) = rx.recv().await {
-                let event = match serde_json::to_string(&msg) {
-                    Ok(data) => Ok(Event::default().data(data)),
-                    Err(e) => {
-                        warn!("Failed to serialize message in SSE stream: {}", e);
-                        Ok(Event::default().data(r#"{"error": "serialization failed"}"#))
+            loop {
+                match rx.recv().await {
+                    Ok(msg) => {
+                        let event = match serde_json::to_string(&msg) {
+                            Ok(data) => Ok(Event::default().data(data)),
+                            Err(e) => {
+                                warn!("Failed to serialize message in SSE stream: {}", e);
+                                Ok(Event::default().data(r#"{"error": "serialization failed"}"#))
+                            }
+                        };
+                        if event_tx.send(event).is_err() {
+                            break;
+                        }
                     }
-                };
-                if event_tx.send(event).is_err() {
-                    break;
+                    Err(RecvError::Lagged(n)) => {
+                        warn!("SSE subscriber lagged on topic '{}', skipped {} messages", topic_name, n);
+                        if disconnect_on_lag {
+                            let _ = event_tx.send(Ok(Event::default().data(
+                                format!(r#"{{"warning":"lagged","skipped":{}}}"#, n)
+                            )));
+                            break;
+                        }
+                        // "drop" strategy: notify and continue
+                        if event_tx.send(Ok(Event::default().data(
+                            format!(r#"{{"warning":"lagged","skipped":{}}}"#, n)
+                        ))).is_err() {
+                            break;
+                        }
+                    }
+                    Err(RecvError::Closed) => break,
                 }
             }
         });

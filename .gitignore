@@ -29,3 +29,9 @@ yarn-error.log*
 # Project specific
 error.log
 debug.log
+
+.claude/
+CLAUDE.md
+DOCKER_PUBLISH.md
+.tsk
+.kungfu

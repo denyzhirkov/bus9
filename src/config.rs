@@ -64,14 +64,36 @@ pub struct AppArgs {
     /// Maximum queue depth (0 = unlimited)
     #[arg(long, env = "BUS9_MAX_QUEUE_DEPTH", default_value_t = 0)]
     pub max_queue_depth: usize,
+
+    /// Enable access logging for HTTP requests (level controlled via RUST_LOG)
+    #[arg(long, env = "BUS9_ACCESS_LOG", default_value_t = false)]
+    pub access_log: bool,
+
+    /// Backpressure strategy when subscriber is too slow: "drop" (skip + notify) or "disconnect"
+    #[arg(long, env = "BUS9_BACKPRESSURE", default_value = "drop")]
+    pub backpressure: String,
+
+    /// ACK timeout in seconds for queue messages (0 = ACK disabled, pop deletes immediately)
+    #[arg(long, env = "BUS9_ACK_TIMEOUT", default_value_t = 0)]
+    pub ack_timeout: u64,
+
+    /// Max delivery attempts before moving to DLQ (0 = no DLQ, infinite retries)
+    #[arg(long, env = "BUS9_MAX_RETRIES", default_value_t = 0)]
+    pub max_retries: u32,
+
+    /// Suffix for Dead Letter Queue names (e.g. queue "orders" -> "orders.dlq")
+    #[arg(long, env = "BUS9_DLQ_SUFFIX", default_value = ".dlq")]
+    pub dlq_suffix: String,
 }
 
 pub struct AppConfig {
     pub stats_interval_ms: u64,
+    /// "drop" = skip lagged messages + notify client, "disconnect" = close connection
+    pub backpressure: String,
 }
 
 impl AppConfig {
-    pub fn new(stats_interval_ms: u64) -> Self {
-        Self { stats_interval_ms }
+    pub fn new(stats_interval_ms: u64, backpressure: String) -> Self {
+        Self { stats_interval_ms, backpressure }
     }
 }

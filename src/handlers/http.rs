@@ -21,6 +21,8 @@ pub const REQ_QUEUE_PUSH: &str = "POST /api/queue";
 pub const REQ_QUEUE_POP: &str = "GET /api/queue";
 pub const REQ_STATS: &str = "GET /api/stats";
 pub const REQ_METRICS: &str = "GET /api/metrics";
+pub const REQ_QUEUE_ACK: &str = "POST /api/queue/:name/ack";
+pub const REQ_QUEUE_NACK: &str = "POST /api/queue/:name/nack";
 
 #[derive(Deserialize)]
 pub struct PublishParams {
@@ -143,6 +145,50 @@ pub async fn pop_queue_handler(
         Json(msg).into_response()
     } else {
         (StatusCode::NO_CONTENT, "Queue empty").into_response()
+    }
+}
+
+#[derive(Deserialize)]
+pub struct AckParams {
+    pub id: String,
+    pub token: Option<String>,
+}
+
+pub async fn ack_queue_handler(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Query(params): Query<AckParams>,
+) -> impl IntoResponse {
+    if let Err(status) = check_auth(&state, params.token.as_ref()) {
+        return (status, "Unauthorized").into_response();
+    }
+
+    state.metrics.increment(REQ_QUEUE_ACK);
+    match state.engine.ack_queue(&name, &params.id) {
+        Ok(()) => Json(serde_json::json!({ "status": "acked", "id": params.id })).into_response(),
+        Err(e) => {
+            warn!("ACK failed for queue '{}', message '{}': {}", name, params.id, e);
+            (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e }))).into_response()
+        }
+    }
+}
+
+pub async fn nack_queue_handler(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Query(params): Query<AckParams>,
+) -> impl IntoResponse {
+    if let Err(status) = check_auth(&state, params.token.as_ref()) {
+        return (status, "Unauthorized").into_response();
+    }
+
+    state.metrics.increment(REQ_QUEUE_NACK);
+    match state.engine.nack_queue(&name, &params.id) {
+        Ok(()) => Json(serde_json::json!({ "status": "nacked", "id": params.id })).into_response(),
+        Err(e) => {
+            warn!("NACK failed for queue '{}', message '{}': {}", name, params.id, e);
+            (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e }))).into_response()
+        }
     }
 }
 

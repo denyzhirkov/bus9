@@ -35,6 +35,9 @@ async fn main() {
         max_topics: args.max_topics,
         max_queues: args.max_queues,
         max_queue_depth: args.max_queue_depth,
+        ack_timeout_ms: args.ack_timeout.saturating_mul(1000),
+        max_retries: args.max_retries,
+        dlq_suffix: args.dlq_suffix,
     };
 
     let engine = Arc::new(Engine::new(engine_config));
@@ -55,12 +58,12 @@ async fn main() {
     let state = Arc::new(AppState {
         engine,
         metrics,
-        config: AppConfig::new(args.stats_interval_ms),
+        config: AppConfig::new(args.stats_interval_ms, args.backpressure),
         auth_token: args.auth_token,
         version: version.clone(),
     });
 
-    let app = create_router(state);
+    let app = create_router(state, args.access_log);
 
     let addr: SocketAddr = match format!("{}:{}", args.host, args.port).parse() {
         Ok(addr) => addr,
